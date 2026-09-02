@@ -66,7 +66,32 @@ class AgentConfig:
     llm_effort: str = "high"
     llm_max_tokens: int = 16000
     llm_enable_fallbacks: bool = True
+    llm_fallback_models: tuple[str, ...] = ()
+    llm_timeout: float = 600.0
+    llm_max_retries: int = 2
     extra_sandbox_env: dict[str, str] = field(default_factory=dict)
+
+    # -- ciclo autônomo
+    max_retries: int = 3               # tentativas de patch fracassadas (rollback/patch inválido) antes de desistir
+    total_timeout: float | None = None # tempo máximo (s) de um ``run`` inteiro; None = sem limite
+    test_command: tuple[str, ...] | None = None  # ex.: ("-m", "unittest", "discover", "-s", "tests")
+    observation_interval: float = 5.0  # segundos entre observações visuais "por tempo"
+    log_patterns: tuple[str, ...] = ("*.log", "logs/*.log")
+
+    # -- visão
+    vision_enabled: bool = False
+    vision_source: str = "camera"      # camera | screen | image
+    vision_camera_index: int = 0
+    vision_monitor: int = 1
+    vision_images: tuple[str, ...] = ()
+    vision_fps: float = 2.0
+    vision_store_frames: bool = False
+
+    # -- memória e segurança
+    memory_limit: int = 100
+    memory_persist: bool = True        # grava memória em <backup_dir>/memory.json
+    max_patch_files: int = 8
+    max_removed_ratio: float = 0.6
 
     def __post_init__(self) -> None:
         # Normaliza a raiz para um Path absoluto e resolvido (sem symlinks),
@@ -78,11 +103,27 @@ class AgentConfig:
             raise ValueError("max_iterations deve ser >= 1")
         if self.sandbox_timeout <= 0:
             raise ValueError("sandbox_timeout deve ser > 0")
+        if self.max_retries < 0:
+            raise ValueError("max_retries deve ser >= 0")
+        if self.observation_interval < 0:
+            raise ValueError("observation_interval deve ser >= 0")
+        if self.vision_source not in ("camera", "screen", "image"):
+            raise ValueError("vision_source deve ser camera, screen ou image")
+        if self.llm_effort not in ("low", "medium", "high", "xhigh", "max"):
+            raise ValueError("llm_effort inválido")
+        self.test_command = tuple(self.test_command) if self.test_command else None
+        self.llm_fallback_models = tuple(self.llm_fallback_models)
+        self.vision_images = tuple(str(p) for p in self.vision_images)
 
     @property
     def backup_dir(self) -> Path:
         """Caminho absoluto da pasta de backups."""
         return self.project_root / self.backup_dir_name
+
+    @property
+    def memory_path(self) -> Path | None:
+        """Arquivo de memória persistente (ou ``None`` se desligada)."""
+        return self.backup_dir / "memory.json" if self.memory_persist else None
 
     @property
     def all_protected_paths(self) -> tuple[str, ...]:
@@ -91,12 +132,17 @@ class AgentConfig:
 
 
 def setup_logging(level: str = "INFO") -> logging.Logger:
-    """Configura (uma única vez) o logger raiz do pacote e o devolve."""
+    """Configura (uma única vez) o logger raiz do pacote e o devolve.
+
+    O formatter redige credenciais (ver ``safety.redact``) em toda linha.
+    """
+    from .safety import RedactingFormatter
+
     logger = logging.getLogger("agent_core")
     if not logger.handlers:
         handler = logging.StreamHandler()
         handler.setFormatter(
-            logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s")
+            RedactingFormatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s")
         )
         logger.addHandler(handler)
     logger.setLevel(level.upper())

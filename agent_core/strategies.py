@@ -1,24 +1,24 @@
 """
-Estratégias de correção: quem "pensa" o patch a partir de uma falha.
+Estratégias: quem transforma evidências numa decisão.
 
-O loop do agente é agnóstico a *como* a correção é formulada. Ele entrega um
-``FailureContext`` (traceback parseado, fonte do arquivo, análise AST,
-histórico de tentativas) e espera de volta um ``FixProposal`` (lista de
-``FilePatch`` + justificativa + confiança) ou ``None`` ("não sei corrigir").
+Contrato (usado pelo AgentLoop)::
 
-Estratégias incluídas:
+    decision = await strategy.decide(ctx)      # ctx: FailureContext
+    decision.action in {patch, observe_again, run_tests, rollback, finish}
 
-* ``HeuristicFixStrategy`` - regras determinísticas, 100% offline, para as
-  falhas mais mecânicas (import faltando, tab/espaço, nome definido em outro
-  módulo do projeto). Rápida, barata e previsível.
-* ``ClaudeFixStrategy`` - usa o SDK oficial ``anthropic`` para pedir ao modelo
-  uma correção estruturada em JSON. É o "cérebro" de propósito geral.
-* ``CompositeFixStrategy`` - encadeia estratégias: tenta a heurística
-  primeiro e cai para o LLM só quando necessário.
+Implementações:
 
-A interface é assíncrona e o contexto é um dataclass simples, então é trivial
-plugar outras fontes (outro LLM, um humano no loop, entradas multimodais como
-screenshots de erro adicionadas ao ``FailureContext.attachments``).
+* ``FixStrategy`` (base): mantém o método clássico ``propose(ctx) -> FixProposal``
+  e o adapta a ``decide`` (proposta -> ação ``patch``; ``None`` -> ``finish``).
+* ``HeuristicFixStrategy``: regras determinísticas, offline.
+* ``ModelFixStrategy``: pede ao ``ModelProvider`` um patch em JSON, enviando
+  texto e imagens do ``MultimodalContext``.
+* ``ClaudeFixStrategy``: ``ModelFixStrategy`` já ligado ao ``AnthropicProvider``
+  (mantido por compatibilidade com a API anterior).
+* ``AutoStrategy``: combina evidências (traceback, logs, testes, visão, memória)
+  num ``Diagnosis`` e percorre uma lista extensível de ``Planner`` para decidir
+  dinamicamente a próxima ação.
+* ``CompositeFixStrategy``: encadeia estratégias clássicas.
 """
 
 from __future__ import annotations
@@ -29,10 +29,21 @@ import re
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from enum import Enum
+from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
 
 from .code_manager import FilePatch, ModuleAnalysis, Replacement
 from .config import AgentConfig
+from .memory import AgentMemory, patch_signature
+from .observations import MultimodalContext, ObservationKind
+from .providers import (
+    ContentPart,
+    ModelMessage,
+    ModelProvider,
+    ModelRequest,
+    ProviderError,
+    ProviderInterrupted,
+)
 from .sandbox import ExecutionResult
 
 logger = logging.getLogger("agent_core.strategies")
@@ -47,7 +58,7 @@ class AttemptSummary:
     error_signature: str
     rationale: str
     patched_files: list[str]
-    outcome: str  # "fixed" | "new_error" | "same_error" | "rolled_back"
+    outcome: str  # "fixed" | "new_error" | "same_error" | "rolled_back" | "patch_failed"
 
 
 @dataclass
@@ -62,7 +73,11 @@ class FailureContext:
     project_outline: dict[str, ModuleAnalysis]   # esqueleto de todo o projeto
     attempt: int                                 # número da iteração atual (1-based)
     history: list[AttemptSummary] = field(default_factory=list)
-    attachments: list[Any] = field(default_factory=list)  # gancho multimodal (imagens, logs extras)
+    attachments: list[Any] = field(default_factory=list)  # gancho multimodal genérico
+    multimodal: MultimodalContext | None = None  # observações (código, logs, testes, visão...)
+    memory: AgentMemory | None = None            # memória de execução
+    tests: ExecutionResult | None = None         # último resultado de testes, se houver
+    vision_available: bool = False               # o loop consegue observar visualmente?
 
     @property
     def error_line(self) -> int | None:
@@ -77,6 +92,37 @@ class FixProposal:
     confidence: float = 0.5
     strategy: str = ""
 
+    @property
+    def signature(self) -> str:
+        return patch_signature(self.patches)
+
+
+class ActionKind(str, Enum):
+    PATCH = "patch"
+    OBSERVE_AGAIN = "observe_again"
+    RUN_TESTS = "run_tests"
+    ROLLBACK = "rollback"
+    FINISH = "finish"
+
+
+@dataclass
+class Decision:
+    """Resultado de ``decide``: o que o loop deve fazer a seguir."""
+
+    action: ActionKind
+    proposal: FixProposal | None = None
+    reason: str = ""
+    diagnosis: str = ""
+    strategy: str = ""
+
+    @classmethod
+    def patch(cls, proposal: FixProposal, *, diagnosis: str = "", strategy: str = "") -> "Decision":
+        return cls(ActionKind.PATCH, proposal, proposal.rationale, diagnosis, strategy or proposal.strategy)
+
+    @classmethod
+    def finish(cls, reason: str, *, diagnosis: str = "", strategy: str = "") -> "Decision":
+        return cls(ActionKind.FINISH, None, reason, diagnosis, strategy)
+
 
 # ------------------------------------------------------------------ interface
 class FixStrategy(ABC):
@@ -87,6 +133,13 @@ class FixStrategy(ABC):
     @abstractmethod
     async def propose(self, ctx: FailureContext) -> FixProposal | None:
         """Devolve uma proposta de patch ou ``None`` se não souber corrigir."""
+
+    async def decide(self, ctx: FailureContext) -> Decision:
+        """Adapta ``propose`` ao contrato de decisão do loop."""
+        proposal = await self.propose(ctx)
+        if proposal is None:
+            return Decision.finish("no_fix", strategy=self.name)
+        return Decision.patch(proposal, strategy=proposal.strategy or self.name)
 
 
 # ----------------------------------------------------------------- heurística
@@ -207,11 +260,12 @@ def insert_import(source: str, import_line: str) -> str:
     return "".join(lines)
 
 
-# -------------------------------------------------------------------- Claude
+# ------------------------------------------------------------- via provider
 _SYSTEM_PROMPT = """\
 Você é o módulo de auto-correção de um agente autônomo que reescreve o próprio \
-código-fonte Python. Receberá um traceback, o arquivo que falhou (com números de \
-linha), o esqueleto do projeto e o histórico de tentativas anteriores.
+código-fonte Python. Receberá evidências (traceback, arquivo que falhou com \
+números de linha, esqueleto do projeto, logs, resultado de testes, observações \
+visuais e imagens quando existirem) e o histórico de tentativas anteriores.
 
 Sua tarefa: propor a menor alteração que corrija a causa raiz do erro, sem \
 mudar o comportamento pretendido do programa. Nunca "corrija" silenciando a \
@@ -234,99 +288,77 @@ segura possível, devolva {"rationale": "...", "confidence": 0, "patches": []}.
 """
 
 
-class ClaudeFixStrategy(FixStrategy):
-    """Formula correções usando o SDK oficial ``anthropic``.
+class ModelFixStrategy(FixStrategy):
+    """Formula correções perguntando a um ``ModelProvider`` (qualquer backend)."""
 
-    Requer ``pip install anthropic`` e credenciais no ambiente
-    (``ANTHROPIC_API_KEY`` ou perfil de ``ant auth login``). O import é
-    preguiçoso para que o núcleo funcione sem o SDK instalado quando apenas a
-    estratégia heurística é usada.
-    """
+    name = "model"
 
-    name = "claude"
-
-    def __init__(self, config: AgentConfig, client: Any | None = None) -> None:
-        self.config = config
-        self._client = client  # permite injetar um cliente falso em testes
-
-    def _get_client(self):
-        if self._client is None:
-            try:
-                import anthropic  # import tardio proposital
-            except ImportError as exc:  # pragma: no cover
-                raise RuntimeError(
-                    "ClaudeFixStrategy requer o pacote 'anthropic' (pip install anthropic)."
-                ) from exc
-            self._client = anthropic.AsyncAnthropic()
-        return self._client
+    def __init__(self, provider: ModelProvider, *, system_prompt: str = _SYSTEM_PROMPT, include_images: bool = True) -> None:
+        self.provider = provider
+        self.system_prompt = system_prompt
+        self.include_images = include_images
+        self.last_response: Any = None
 
     # -- prompt
     @staticmethod
     def _numbered(source: str) -> str:
         return "\n".join(f"{i:4d} | {line}" for i, line in enumerate(source.splitlines(), 1))
 
-    def build_prompt(self, ctx: FailureContext) -> str:
+    def build_prompt(self, ctx: FailureContext, diagnosis: str = "") -> str:
         parts = [f"## Script executado\n{ctx.script}"]
+        if diagnosis:
+            parts.append(f"## Diagnóstico preliminar\n{diagnosis}")
         parts.append(f"## Resultado\n{ctx.result.summary()}")
         if ctx.result.stderr.strip():
             parts.append(f"## stderr (traceback)\n```\n{ctx.result.stderr.strip()[-6000:]}\n```")
         if ctx.result.stdout.strip():
             parts.append(f"## stdout (últimas linhas)\n```\n{ctx.result.stdout.strip()[-2000:]}\n```")
         if ctx.failing_file and ctx.failing_source is not None:
-            parts.append(
-                f"## Arquivo que falhou: {ctx.failing_file}\n```python\n{self._numbered(ctx.failing_source)}\n```"
-            )
+            parts.append(f"## Arquivo que falhou: {ctx.failing_file}\n```python\n{self._numbered(ctx.failing_source)}\n```")
         if ctx.project_outline:
             outline = "\n\n".join(a.outline() for a in ctx.project_outline.values())
             parts.append(f"## Esqueleto do projeto\n```\n{outline[:8000]}\n```")
-        if ctx.history:
+        if ctx.tests is not None:
+            parts.append(f"## Testes\n{ctx.tests.summary()}\n```\n{ctx.tests.stderr.strip()[-3000:]}\n```")
+        if ctx.multimodal is not None:
+            extra = [o for o in ctx.multimodal.observations if o.kind in (ObservationKind.LOG, ObservationKind.VISION, ObservationKind.TEST)]
+            if extra:
+                parts.append("## Outras evidências\n" + "\n\n".join(o.to_prompt_text(2000) for o in extra[-8:]))
+        if ctx.memory is not None and len(ctx.memory):
+            parts.append(f"## Memória do agente (não repita)\n{ctx.memory.to_prompt_text()}")
+        elif ctx.history:
             hist = "\n".join(
-                f"- tentativa {h.attempt}: {h.rationale} -> {h.outcome} (arquivos: {', '.join(h.patched_files)})"
-                for h in ctx.history
+                f"- tentativa {h.attempt}: {h.rationale} -> {h.outcome} (arquivos: {', '.join(h.patched_files)})" for h in ctx.history
             )
             parts.append(f"## Tentativas anteriores (não repita)\n{hist}")
         parts.append(f"## Iteração atual\n{ctx.attempt}")
         return "\n\n".join(parts)
 
+    def build_request(self, ctx: FailureContext, diagnosis: str = "") -> ModelRequest:
+        parts: list[ContentPart] = [ContentPart.from_text(self.build_prompt(ctx, diagnosis))]
+        if self.include_images and ctx.multimodal is not None and self.provider.supports_images:
+            for obs in reversed(ctx.multimodal.images()):
+                parts.append(ContentPart.from_text(f"[imagem: {obs.source}] {obs.summary}"))
+                parts.append(ContentPart.from_image(obs.image.data, obs.image.media_type))
+        return ModelRequest(messages=[ModelMessage("user", parts)], system=self.system_prompt)
+
     # -- chamada
-    async def propose(self, ctx: FailureContext) -> FixProposal | None:
-        client = self._get_client()
-        prompt = self.build_prompt(ctx)
-        kwargs: dict[str, Any] = dict(
-            model=self.config.llm_model,
-            max_tokens=self.config.llm_max_tokens,
-            system=_SYSTEM_PROMPT,
-            thinking={"type": "adaptive"},
-            output_config={"effort": self.config.llm_effort},
-            messages=[{"role": "user", "content": prompt}],
-        )
+    async def propose(self, ctx: FailureContext, diagnosis: str = "") -> FixProposal | None:
+        request = self.build_request(ctx, diagnosis)
         try:
-            # Streaming evita timeouts em respostas longas; get_final_message()
-            # devolve a mensagem completa quando não precisamos dos eventos.
-            if self.config.llm_enable_fallbacks:
-                # Fallback server-side: se o modelo recusar por política, a API
-                # reexecuta o mesmo pedido num modelo alternativo na mesma chamada.
-                async with client.beta.messages.stream(
-                    betas=["server-side-fallback-2026-07-01"],
-                    fallbacks="default",
-                    **kwargs,
-                ) as stream:
-                    message = await stream.get_final_message()
-            else:
-                async with client.messages.stream(**kwargs) as stream:
-                    message = await stream.get_final_message()
-        except Exception as exc:  # erros de rede/API não podem derrubar o loop
-            logger.error("Falha ao consultar o modelo: %s", exc)
+            response = await self.provider.complete(request)
+        except ProviderInterrupted:
+            raise
+        except ProviderError as exc:
+            logger.error("provider %s falhou: %s", self.provider.name, exc)
             return None
-
-        if message.stop_reason == "refusal":
-            logger.warning("O modelo recusou a solicitação de correção.")
-            return None
-        if message.stop_reason == "max_tokens":
-            logger.warning("Resposta truncada por max_tokens; aumente llm_max_tokens.")
-
-        text = "".join(block.text for block in message.content if getattr(block, "type", "") == "text")
-        return self.parse_response(text)
+        self.last_response = response
+        if response.truncated:
+            logger.warning("resposta truncada por max_tokens; aumente llm_max_tokens.")
+        proposal = self.parse_response(response.text)
+        if proposal is not None:
+            proposal.strategy = self.name
+        return proposal
 
     # -- parse
     def parse_response(self, text: str) -> FixProposal | None:
@@ -337,11 +369,13 @@ class ClaudeFixStrategy(FixStrategy):
             return None
         patches: list[FilePatch] = []
         for raw in data.get("patches", []) or []:
+            if not isinstance(raw, dict):
+                continue
             path = raw.get("path")
             if not path:
                 continue
             if raw.get("mode") == "replace_full" or "content" in raw:
-                patches.append(FilePatch(path=path, content=raw.get("content", ""), reason="claude:replace_full"))
+                patches.append(FilePatch(path=path, content=raw.get("content", ""), reason="model:replace_full"))
             else:
                 reps = [
                     Replacement(search=r["search"], replace=r.get("replace", ""), count=int(r.get("count", 1)))
@@ -349,7 +383,7 @@ class ClaudeFixStrategy(FixStrategy):
                     if isinstance(r, dict) and r.get("search")
                 ]
                 if reps:
-                    patches.append(FilePatch(path=path, replacements=reps, reason="claude:search_replace"))
+                    patches.append(FilePatch(path=path, replacements=reps, reason="model:search_replace"))
         if not patches:
             logger.info("Modelo não propôs patches: %s", data.get("rationale"))
             return None
@@ -363,6 +397,33 @@ class ClaudeFixStrategy(FixStrategy):
             confidence=max(0.0, min(1.0, confidence)),
             strategy=self.name,
         )
+
+
+class ClaudeFixStrategy(ModelFixStrategy):
+    """``ModelFixStrategy`` já ligado ao SDK oficial (via ``AnthropicProvider``).
+
+    Mantido por compatibilidade. ``client`` permite injetar um cliente falso.
+    """
+
+    name = "claude"
+
+    def __init__(self, config: AgentConfig, client: Any | None = None, provider: ModelProvider | None = None) -> None:
+        if provider is None:
+            from .providers import AnthropicProvider, build_provider
+
+            if client is not None:
+                provider = AnthropicProvider(
+                    model=config.llm_model,
+                    max_tokens=config.llm_max_tokens,
+                    effort=config.llm_effort,
+                    server_fallbacks=config.llm_enable_fallbacks,
+                    timeout=config.llm_timeout,
+                    client=client,
+                )
+            else:
+                provider = build_provider(config)
+        super().__init__(provider)
+        self.config = config
 
 
 def _extract_json(text: str) -> Any:
@@ -398,6 +459,8 @@ class CompositeFixStrategy(FixStrategy):
         for strategy in self.strategies:
             try:
                 proposal = await strategy.propose(ctx)
+            except ProviderInterrupted:
+                raise
             except Exception as exc:
                 logger.error("Estratégia %s falhou: %s", strategy.name, exc)
                 continue
@@ -405,3 +468,306 @@ class CompositeFixStrategy(FixStrategy):
                 logger.info("Proposta obtida via '%s' (confiança %.2f)", strategy.name, proposal.confidence)
                 return proposal
         return None
+
+
+# ================================================================= AUTO ======
+@dataclass
+class Finding:
+    """Uma evidência interpretada por um analisador."""
+
+    source: str          # traceback | logs | tests | vision | memory | ...
+    summary: str
+    severity: float = 0.5  # 0..1
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Diagnosis:
+    findings: list[Finding] = field(default_factory=list)
+    primary_cause: str = ""
+    needs: set[str] = field(default_factory=set)   # "code" | "vision" | "tests" | "logs" | "observe_again"
+
+    @property
+    def sources(self) -> set[str]:
+        return {f.source for f in self.findings}
+
+    def to_text(self) -> str:
+        lines = [f"causa provável: {self.primary_cause or 'indeterminada'}"]
+        for f in sorted(self.findings, key=lambda f: -f.severity):
+            lines.append(f"- [{f.source} sev={f.severity:.1f}] {f.summary}")
+        if self.needs:
+            lines.append(f"necessidades: {', '.join(sorted(self.needs))}")
+        return "\n".join(lines)
+
+
+@runtime_checkable
+class EvidenceAnalyzer(Protocol):
+    name: str
+
+    def analyze(self, ctx: FailureContext) -> list[Finding]: ...
+
+
+@runtime_checkable
+class Planner(Protocol):
+    name: str
+
+    async def plan(self, ctx: FailureContext, diagnosis: Diagnosis) -> Decision | None: ...
+
+
+# -- analisadores
+class TracebackAnalyzer:
+    name = "traceback"
+
+    def analyze(self, ctx: FailureContext) -> list[Finding]:
+        r = ctx.result
+        if r.timed_out:
+            return [Finding("runtime", f"execução excedeu o tempo limite ({r.duration:.0f}s): possível loop infinito ou bloqueio", 0.9)]
+        tb = r.traceback
+        if tb is None:
+            if not r.success:
+                return [Finding("runtime", f"processo terminou com código {r.returncode} sem traceback", 0.6, {"stderr": r.stderr[-500:]})]
+            return []
+        loc = tb.location
+        where = f"{loc.file}:{loc.line} ({loc.function})" if loc else "?"
+        sev = 0.95 if tb.exc_type in ("SyntaxError", "IndentationError", "ImportError", "ModuleNotFoundError", "NameError") else 0.8
+        return [Finding("traceback", f"{tb.exc_type}: {tb.message} em {where}", sev, {"exception": tb.exc_type, "line": loc.line if loc else None})]
+
+
+class LogAnalyzer:
+    name = "logs"
+    KEYWORDS = ("error", "exception", "traceback", "critical", "fatal")
+
+    def analyze(self, ctx: FailureContext) -> list[Finding]:
+        findings: list[Finding] = []
+        if ctx.multimodal is None:
+            return findings
+        for obs in ctx.multimodal.by_kind(ObservationKind.LOG):
+            lines = obs.extracted.get("relevant_lines") or []
+            hits = [l for l in lines if any(k in l.lower() for k in self.KEYWORDS)]
+            if hits:
+                findings.append(Finding("logs", f"{len(hits)} linhas de erro em {obs.source}: {hits[-1][:160]}", 0.5, {"lines": hits[-5:]}))
+        # stdout/stderr do próprio run também são "logs"
+        for line in ctx.result.stdout.splitlines()[-50:]:
+            if any(k in line.lower() for k in self.KEYWORDS):
+                findings.append(Finding("logs", f"stdout menciona erro: {line[:160]}", 0.3))
+                break
+        return findings
+
+
+class TestAnalyzer:
+    name = "tests"
+
+    def analyze(self, ctx: FailureContext) -> list[Finding]:
+        tests = ctx.tests
+        if tests is None and ctx.multimodal is not None:
+            obs = ctx.multimodal.latest(ObservationKind.TEST)
+            if obs is not None and not obs.extracted.get("passed", True):
+                failed = obs.extracted.get("failed_tests") or []
+                return [Finding("tests", f"testes falhando: {', '.join(failed[:3]) or 'ver saída'}", 0.85, {"failed": failed})]
+            return []
+        if tests is not None and not tests.success:
+            failed = [l for l in tests.stderr.splitlines() if l.startswith(("FAIL:", "ERROR:"))]
+            return [Finding("tests", f"testes falhando: {', '.join(failed[:3]) or tests.summary()}", 0.85, {"failed": failed})]
+        return []
+
+
+class VisionAnalyzer:
+    name = "vision"
+    ERROR_WORDS = ("error", "erro", "exception", "traceback", "failed", "falha")
+
+    def analyze(self, ctx: FailureContext) -> list[Finding]:
+        findings: list[Finding] = []
+        if ctx.multimodal is None:
+            return findings
+        visions = ctx.multimodal.by_kind(ObservationKind.VISION)
+        if not visions:
+            return findings
+        latest = visions[-1]
+        if latest.metadata.get("invalid"):
+            findings.append(Finding("vision", "último frame inválido", 0.2))
+            return findings
+        text = latest.extracted.get("text")
+        if text and any(w in text.lower() for w in self.ERROR_WORDS):
+            findings.append(Finding("vision", f"a tela mostra um erro: {text[:160]!r}", 0.7, {"text": text}))
+        change = latest.extracted.get("change") or {}
+        if len(visions) >= 2 and change.get("changed"):
+            findings.append(Finding("vision", f"a interface mudou {change.get('score', 0) * 100:.1f}% desde a observação anterior ({len(change.get('regions', []))} regiões)", 0.4, change))
+        elif len(visions) >= 2 and not change.get("changed"):
+            findings.append(Finding("vision", "sem mudança visual entre observações", 0.2))
+        findings.append(Finding("vision", latest.summary, 0.3, {"resolution": latest.extracted.get("resolution")}))
+        return findings
+
+
+class MemoryAnalyzer:
+    name = "memory"
+
+    def analyze(self, ctx: FailureContext) -> list[Finding]:
+        if ctx.memory is None:
+            return []
+        failed = ctx.memory.failed_attempts(ctx.result.signature)
+        if not failed:
+            return []
+        files = sorted({f for e in failed for f in e.patch_files})
+        return [Finding("memory", f"{len(failed)} tentativas anteriores falharam para este erro (arquivos: {', '.join(files) or '-'})", 0.6, {"attempts": len(failed)})]
+
+
+# -- planejadores
+class ObservationPlanner:
+    """Pede uma nova observação quando as evidências são insuficientes."""
+
+    name = "observe"
+
+    def __init__(self, max_observations: int = 1) -> None:
+        self.max_observations = max_observations
+
+    async def plan(self, ctx: FailureContext, diagnosis: Diagnosis) -> Decision | None:
+        if "observe_again" not in diagnosis.needs:
+            return None
+        already = ctx.memory.count_action("observe_again", ctx.result.signature) if ctx.memory else 0
+        if already >= self.max_observations:
+            return None
+        return Decision(ActionKind.OBSERVE_AGAIN, reason="evidências insuficientes: nova observação", diagnosis=diagnosis.to_text(), strategy=self.name)
+
+
+class HeuristicPlanner:
+    """Usa a ``HeuristicFixStrategy`` quando o diagnóstico é mecânico."""
+
+    name = "heuristic"
+
+    def __init__(self, heuristic: HeuristicFixStrategy | None = None) -> None:
+        self.heuristic = heuristic or HeuristicFixStrategy()
+
+    async def plan(self, ctx: FailureContext, diagnosis: Diagnosis) -> Decision | None:
+        proposal = await self.heuristic.propose(ctx)
+        if proposal is None:
+            return None
+        if ctx.memory is not None and ctx.memory.has_tried(proposal.signature):
+            return None  # já falhou antes; deixa outro planner tentar
+        return Decision.patch(proposal, diagnosis=diagnosis.to_text(), strategy=self.name)
+
+
+class ModelPlanner:
+    """Consulta o provider com o contexto multimodal completo."""
+
+    name = "model"
+
+    def __init__(self, provider: ModelProvider | None, *, max_attempts: int = 3) -> None:
+        self.strategy = ModelFixStrategy(provider) if provider is not None else None
+        self.max_attempts = max_attempts
+
+    async def plan(self, ctx: FailureContext, diagnosis: Diagnosis) -> Decision | None:
+        if self.strategy is None:
+            return None
+        for _ in range(2):  # uma segunda chance se a primeira proposta já foi tentada
+            proposal = await self.strategy.propose(ctx, diagnosis.to_text())
+            if proposal is None:
+                return None
+            if ctx.memory is not None and ctx.memory.has_tried(proposal.signature):
+                logger.info("modelo repetiu um patch já fracassado; pedindo alternativa")
+                continue
+            return Decision.patch(proposal, diagnosis=diagnosis.to_text(), strategy=self.name)
+        return None
+
+
+class RollbackPlanner:
+    """Se o erro atual surgiu após um patch que "progrediu" mas o loop está
+    acumulando falhas, prefere reverter ao estado anterior."""
+
+    name = "rollback"
+
+    def __init__(self, after_failures: int = 3) -> None:
+        self.after_failures = after_failures
+
+    async def plan(self, ctx: FailureContext, diagnosis: Diagnosis) -> Decision | None:
+        if ctx.memory is None:
+            return None
+        last = ctx.memory.last()
+        failed = len(ctx.memory.failed_attempts())
+        if last is not None and last.outcome == "new_error" and failed >= self.after_failures:
+            return Decision(ActionKind.ROLLBACK, reason="muitas falhas após um patch parcial: revertendo", diagnosis=diagnosis.to_text(), strategy=self.name)
+        return None
+
+
+class AutoStrategy(FixStrategy):
+    """Estratégia orientada a evidências.
+
+    ``decide`` = analisar (todos os ``analyzers``) -> diagnosticar -> percorrer
+    ``planners`` em ordem até um devolver uma ``Decision``. Ambos são listas
+    públicas: adicione/remova/reordene para estender o comportamento.
+    """
+
+    name = "auto"
+
+    def __init__(
+        self,
+        provider: ModelProvider | None = None,
+        *,
+        analyzers: list[EvidenceAnalyzer] | None = None,
+        planners: list[Planner] | None = None,
+        use_heuristics: bool = True,
+        diagnose_hook: Callable[[Diagnosis], Awaitable[None] | None] | None = None,
+    ) -> None:
+        self.provider = provider
+        self.analyzers: list[EvidenceAnalyzer] = analyzers if analyzers is not None else [
+            TracebackAnalyzer(), TestAnalyzer(), LogAnalyzer(), VisionAnalyzer(), MemoryAnalyzer()
+        ]
+        if planners is not None:
+            self.planners: list[Planner] = planners
+        else:
+            self.planners = [ObservationPlanner(), RollbackPlanner()]
+            if use_heuristics:
+                self.planners.append(HeuristicPlanner())
+            self.planners.append(ModelPlanner(provider))
+        self._diagnose_hook = diagnose_hook
+        self.last_diagnosis: Diagnosis | None = None
+
+    # -- diagnóstico
+    def diagnose(self, ctx: FailureContext) -> Diagnosis:
+        findings: list[Finding] = []
+        for analyzer in self.analyzers:
+            try:
+                findings.extend(analyzer.analyze(ctx))
+            except Exception as exc:  # um analisador quebrado não invalida os outros
+                findings.append(Finding(getattr(analyzer, "name", "analyzer"), f"analisador falhou: {exc}", 0.1))
+        diagnosis = Diagnosis(findings=findings)
+        if findings:
+            top = max(findings, key=lambda f: f.severity)
+            diagnosis.primary_cause = top.summary
+        else:
+            diagnosis.primary_cause = "falha sem evidências estruturadas"
+        # Necessidades: o que ainda falta para decidir bem.
+        has_tb = any(f.source == "traceback" for f in findings)
+        has_vision = any(f.source == "vision" for f in findings)
+        if not has_tb and ctx.vision_available and not has_vision:
+            diagnosis.needs.add("observe_again")  # sem traceback: só a tela pode explicar
+        if ctx.failing_file is not None:
+            diagnosis.needs.add("code")
+        if ctx.tests is not None and not ctx.tests.success:
+            diagnosis.needs.add("tests")
+        return diagnosis
+
+    async def decide(self, ctx: FailureContext) -> Decision:
+        diagnosis = self.diagnose(ctx)
+        self.last_diagnosis = diagnosis
+        if self._diagnose_hook is not None:
+            maybe = self._diagnose_hook(diagnosis)
+            if maybe is not None:
+                await maybe
+        for planner in self.planners:
+            try:
+                decision = await planner.plan(ctx, diagnosis)
+            except ProviderInterrupted:
+                raise
+            except Exception as exc:
+                logger.error("planner %s falhou: %s", getattr(planner, "name", planner), exc)
+                continue
+            if decision is not None:
+                if not decision.diagnosis:
+                    decision.diagnosis = diagnosis.to_text()
+                return decision
+        return Decision.finish("no_fix", diagnosis=diagnosis.to_text(), strategy=self.name)
+
+    async def propose(self, ctx: FailureContext) -> FixProposal | None:
+        """Compatibilidade com o contrato clássico: devolve só o patch, se houver."""
+        decision = await self.decide(ctx)
+        return decision.proposal

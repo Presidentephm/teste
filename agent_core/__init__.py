@@ -2,17 +2,22 @@
 agent_core
 ==========
 
-Núcleo do agente autônomo auto-modificável.
+Núcleo do agente autônomo multimodal auto-modificável.
 
 Camadas (de baixo para cima):
 
-    config        -> AgentConfig: parâmetros globais (raiz do projeto, limites, LLM).
-    backup        -> BackupManager: cópias de segurança com timestamp + rollback.
+    config        -> AgentConfig: parâmetros globais.
+    safety        -> redação de credenciais e guarda de patches.
+    backup        -> BackupManager: backups com timestamp, checkpoints e rollback.
     code_manager  -> CodeManager: leitura, análise (AST) e reescrita segura de .py.
     sandbox       -> Sandbox: execução isolada via subprocess com captura de logs.
-    strategies    -> FixStrategy: quem "pensa" a correção (heurística e/ou Claude).
-    agent_loop    -> SelfImprovementAgent: o loop executar -> falhar -> corrigir.
-    cli           -> interface de linha de comando (python -m agent_core ...).
+    providers     -> ModelProvider: camada desacoplada sobre o SDK Anthropic.
+    observations  -> Observation / MultimodalContext / Observer.
+    vision        -> fontes visuais (câmera, tela, imagem), pipeline OpenCV, captura.
+    memory        -> AgentMemory: o que já foi tentado e o resultado.
+    strategies    -> FixStrategy, HeuristicFixStrategy, ModelFixStrategy, AutoStrategy.
+    agent_loop    -> SelfImprovementAgent: observar -> decidir -> agir -> validar.
+    cli           -> python -m agent_core ...
 
 Uso mínimo::
 
@@ -20,45 +25,80 @@ Uso mínimo::
     from agent_core import AgentConfig, SelfImprovementAgent
 
     config = AgentConfig(project_root=".")
-    agent = SelfImprovementAgent(config)
-    report = asyncio.run(agent.run("examples/broken_script.py"))
+    report = asyncio.run(SelfImprovementAgent(config).run("examples/broken_script.py"))
     print(report.summary())
 """
 
-from .config import AgentConfig
-from .backup import BackupManager, BackupRecord
-from .code_manager import CodeManager, ModuleAnalysis, FilePatch, Replacement
+from .config import AgentConfig, setup_logging
+from .safety import PatchGuard, UnsafePatchError, redact
+from .backup import BackupManager, BackupRecord, Checkpoint
+from .code_manager import CodeManager, ModuleAnalysis, FilePatch, Replacement, InvalidSourceError, PathOutsideProjectError
 from .sandbox import Sandbox, ExecutionResult, TracebackInfo
+from .providers import (
+    ModelProvider,
+    AnthropicProvider,
+    FallbackProvider,
+    FakeProvider,
+    ModelRequest,
+    ModelResponse,
+    ModelMessage,
+    ContentPart,
+    ProviderError,
+    ProviderAuthError,
+    ProviderRateLimitError,
+    ProviderTimeoutError,
+    ProviderUnavailableError,
+    ProviderInvalidResponseError,
+    ProviderRefusalError,
+    ProviderRequestError,
+    ProviderInterrupted,
+    build_provider,
+)
+from .observations import (
+    Observation,
+    ObservationKind,
+    ImageData,
+    MultimodalContext,
+    ContextLimits,
+    Observer,
+    RuntimeObserver,
+    TestObserver,
+    LogObserver,
+    CodeObserver,
+)
+from .memory import AgentMemory, MemoryEntry, patch_signature
 from .strategies import (
     FixStrategy,
     FixProposal,
     FailureContext,
+    Decision,
+    ActionKind,
     HeuristicFixStrategy,
+    ModelFixStrategy,
     ClaudeFixStrategy,
     CompositeFixStrategy,
+    AutoStrategy,
+    Diagnosis,
+    Finding,
 )
 from .agent_loop import SelfImprovementAgent, AgentRunReport, IterationRecord
 
 __all__ = [
-    "AgentConfig",
-    "BackupManager",
-    "BackupRecord",
-    "CodeManager",
-    "ModuleAnalysis",
-    "FilePatch",
-    "Replacement",
-    "Sandbox",
-    "ExecutionResult",
-    "TracebackInfo",
-    "FixStrategy",
-    "FixProposal",
-    "FailureContext",
-    "HeuristicFixStrategy",
-    "ClaudeFixStrategy",
-    "CompositeFixStrategy",
-    "SelfImprovementAgent",
-    "AgentRunReport",
-    "IterationRecord",
+    "AgentConfig", "setup_logging",
+    "PatchGuard", "UnsafePatchError", "redact",
+    "BackupManager", "BackupRecord", "Checkpoint",
+    "CodeManager", "ModuleAnalysis", "FilePatch", "Replacement", "InvalidSourceError", "PathOutsideProjectError",
+    "Sandbox", "ExecutionResult", "TracebackInfo",
+    "ModelProvider", "AnthropicProvider", "FallbackProvider", "FakeProvider", "ModelRequest", "ModelResponse",
+    "ModelMessage", "ContentPart", "ProviderError", "ProviderAuthError", "ProviderRateLimitError",
+    "ProviderTimeoutError", "ProviderUnavailableError", "ProviderInvalidResponseError", "ProviderRefusalError",
+    "ProviderRequestError", "ProviderInterrupted", "build_provider",
+    "Observation", "ObservationKind", "ImageData", "MultimodalContext", "ContextLimits", "Observer",
+    "RuntimeObserver", "TestObserver", "LogObserver", "CodeObserver",
+    "AgentMemory", "MemoryEntry", "patch_signature",
+    "FixStrategy", "FixProposal", "FailureContext", "Decision", "ActionKind", "HeuristicFixStrategy",
+    "ModelFixStrategy", "ClaudeFixStrategy", "CompositeFixStrategy", "AutoStrategy", "Diagnosis", "Finding",
+    "SelfImprovementAgent", "AgentRunReport", "IterationRecord",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

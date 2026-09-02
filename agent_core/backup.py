@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -53,6 +53,20 @@ class BackupRecord:
     existed: bool
     reason: str = ""
     restored_at: str | None = None
+
+
+@dataclass
+class Checkpoint:
+    """Conjunto de backups tirados juntos, antes de uma alteração importante."""
+
+    id: str
+    label: str
+    timestamp: str
+    records: list[BackupRecord] = field(default_factory=list)
+
+    @property
+    def files(self) -> list[str]:
+        return [r.original for r in self.records]
 
 
 class BackupManager:
@@ -203,6 +217,17 @@ class BackupManager:
                     entry["restored_at"] = stamp
             self._save_manifest(entries)
         return BackupRecord(**{**asdict(record), "restored_at": stamp})
+
+    # ------------------------------------------------------------ checkpoint
+    async def checkpoint(self, paths: list[Path], label: str = "") -> Checkpoint:
+        """Faz backup de vários arquivos de uma vez e agrupa num ``Checkpoint``."""
+        iso, stamp = self._now_stamp()
+        records = [await self.backup(p, reason=f"checkpoint:{label or stamp}") for p in paths]
+        return Checkpoint(id=stamp, label=label, timestamp=iso, records=records)
+
+    async def restore(self, checkpoint: Checkpoint) -> list[BackupRecord]:
+        """Restaura todos os arquivos de um checkpoint (LIFO)."""
+        return await self.rollback_many(checkpoint.records)
 
     async def rollback_many(self, records: list[BackupRecord]) -> list[BackupRecord]:
         """Restaura vários arquivos em ordem inversa de criação (LIFO).

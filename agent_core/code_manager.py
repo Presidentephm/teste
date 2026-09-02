@@ -376,8 +376,12 @@ class CodeManager:
         *,
         reason: str = "",
         validate: bool = True,
-    ) -> BackupRecord:
+        backup: bool = True,
+    ) -> BackupRecord | None:
         """Escreve ``content`` em ``path`` com backup prévio e escrita atômica.
+
+        Com ``backup=False`` (usado quando um checkpoint já cobriu o arquivo)
+        devolve ``None``.
 
         Ordem das operações (deliberada):
             1. confinamento;
@@ -392,7 +396,7 @@ class CodeManager:
         if validate and target.suffix == ".py":
             self.validate_syntax(content, self.relative(target))
 
-        record = await self.backups.backup(target, reason=reason)
+        record = await self.backups.backup(target, reason=reason) if backup else None
 
         def _atomic_write() -> None:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -403,7 +407,7 @@ class CodeManager:
         await asyncio.to_thread(_atomic_write)
         return record
 
-    async def apply_patch(self, patch: FilePatch) -> BackupRecord:
+    async def apply_patch(self, patch: FilePatch, *, backup: bool = True) -> BackupRecord | None:
         """Aplica um ``FilePatch`` (substituição total ou busca/substituição).
 
         Raises:
@@ -422,18 +426,36 @@ class CodeManager:
                     )
                 count = rep.count if rep.count > 0 else -1
                 new_source = new_source.replace(rep.search, rep.replace, count)
-        return await self.write(target, new_source, reason=patch.reason or f"patch:{patch.mode}")
+        return await self.write(target, new_source, reason=patch.reason or f"patch:{patch.mode}", backup=backup)
 
-    async def apply_patches(self, patches: Iterable[FilePatch]) -> list[BackupRecord]:
-        """Aplica vários patches em sequência. Se um falhar, reverte os anteriores."""
+    async def apply_patches(self, patches: Iterable[FilePatch], *, backup: bool = True) -> list[BackupRecord]:
+        """Aplica vários patches em sequência. Se um falhar, reverte os anteriores.
+
+        Com ``backup=False`` o chamador é responsável por ter feito um
+        checkpoint antes (e por restaurá-lo se algo falhar).
+        """
         applied: list[BackupRecord] = []
         for patch in patches:
             try:
-                applied.append(await self.apply_patch(patch))
+                record = await self.apply_patch(patch, backup=backup)
             except Exception:
                 await self.backups.rollback_many(applied)
                 raise
+            if record is not None:
+                applied.append(record)
         return applied
+
+    async def current_sources(self, paths: Iterable[str]) -> dict[str, str]:
+        """Conteúdo atual dos arquivos existentes (para validação de patches)."""
+        sources: dict[str, str] = {}
+        for path in paths:
+            try:
+                target = self.resolve(path)
+            except PathOutsideProjectError:
+                continue
+            if target.is_file():
+                sources[path] = await self.read(target)
+        return sources
 
     async def rollback(self, path: str | Path, record: BackupRecord | None = None) -> BackupRecord:
         """Atalho para ``BackupManager.rollback`` com confinamento."""
