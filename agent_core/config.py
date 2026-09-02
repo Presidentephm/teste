@@ -10,6 +10,7 @@ paralelo sobre projetos diferentes.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -169,6 +170,38 @@ class AgentConfig:
     def all_protected_paths(self) -> tuple[str, ...]:
         """Caminhos protegidos, incluindo sempre a pasta de backups."""
         return tuple(dict.fromkeys((*self.protected_paths, self.backup_dir_name)))
+
+
+def load_env_file(path: str | Path, *, override: bool = False) -> list[str]:
+    """Carrega variáveis de um arquivo ``.env`` para ``os.environ``.
+
+    Formato: uma linha ``CHAVE=valor`` por vez; linhas vazias e começadas por
+    ``#`` são ignoradas; aspas simples ou duplas ao redor do valor são
+    removidas. Por padrão o ambiente vence o arquivo (``override=False``), de
+    modo que uma variável já exportada não é sobrescrita.
+
+    Devolve os nomes das variáveis definidas — nunca os valores, para que o
+    chamador possa registrar o que carregou sem vazar credenciais.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return []
+    loaded: list[str] = []
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, value = line.partition("=")
+        name = name.strip().removeprefix("export ").strip()
+        if not name:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if override or name not in os.environ:
+            os.environ[name] = value
+            loaded.append(name)
+    return loaded
 
 
 def setup_logging(level: str = "INFO") -> logging.Logger:

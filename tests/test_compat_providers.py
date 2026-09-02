@@ -154,3 +154,29 @@ class StrategyCompatTests(TempProject):
         strategy = ToolFixStrategy(provider)
         request = strategy.build_request(self.failure_context("app.py"))
         self.assertIsNone(request.output_schema)
+
+
+class EnvFileTests(TempProject):
+    """O .env é conveniência local: não sobrescreve o ambiente nem vaza valores."""
+
+    def test_load_env_file(self):
+        from agent_core.config import load_env_file
+
+        path = self.root / ".env"
+        path.write_text('# comentário\n\nMOONSHOT_API_KEY=sk-do-arquivo\nexport OUTRA="com aspas"\nJA_DEFINIDA=do-arquivo\nlinha-invalida\n')
+        with mock.patch.dict(os.environ, {"JA_DEFINIDA": "do-ambiente"}, clear=False):
+            loaded = load_env_file(path)
+            self.assertEqual(sorted(loaded), ["MOONSHOT_API_KEY", "OUTRA"])
+            self.assertEqual(os.environ["MOONSHOT_API_KEY"], "sk-do-arquivo")
+            self.assertEqual(os.environ["OUTRA"], "com aspas")
+            self.assertEqual(os.environ["JA_DEFINIDA"], "do-ambiente")  # ambiente vence
+            self.assertEqual(load_env_file(path, override=True).count("JA_DEFINIDA"), 1)
+            self.assertEqual(os.environ["JA_DEFINIDA"], "do-arquivo")
+        os.environ.pop("MOONSHOT_API_KEY", None)
+        os.environ.pop("OUTRA", None)
+        os.environ.pop("JA_DEFINIDA", None)
+
+    def test_missing_file_is_noop(self):
+        from agent_core.config import load_env_file
+
+        self.assertEqual(load_env_file(self.root / "nao-existe.env"), [])

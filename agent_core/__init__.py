@@ -29,7 +29,7 @@ Uso mínimo::
     print(report.summary())
 """
 
-from .config import AgentConfig, setup_logging
+from .config import AgentConfig, load_env_file, setup_logging
 from .safety import PatchGuard, UnsafePatchError, redact
 from .backup import BackupManager, BackupRecord, Checkpoint
 from .code_manager import CodeManager, ModuleAnalysis, FilePatch, Replacement, InvalidSourceError, PathOutsideProjectError
@@ -89,7 +89,7 @@ from .strategies import (
 from .agent_loop import SelfImprovementAgent, AgentRunReport, IterationRecord
 
 __all__ = [
-    "AgentConfig", "setup_logging",
+    "AgentConfig", "setup_logging", "load_env_file",
     "PatchGuard", "UnsafePatchError", "redact",
     "BackupManager", "BackupRecord", "Checkpoint",
     "CodeManager", "ModuleAnalysis", "FilePatch", "Replacement", "InvalidSourceError", "PathOutsideProjectError",

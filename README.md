@@ -101,7 +101,7 @@ O núcleo (backup, AST, sandbox, heurística, memória, contexto) usa só a bibl
 O `ModelProvider` existe justamente para trocar o backend sem tocar nas estratégias nem no loop. Provedores que expõem um endpoint no formato Messages funcionam reaproveitando todo o código — inclusive loop de ferramentas, imagens, normalização de erros e contabilidade de uso.
 
 ```bash
-export MOONSHOT_API_KEY='sk-...'
+cp .env.example .env      # preencha a chave; o .env é ignorado pelo Git
 python -m agent_core ask "diga olá" --provider kimi
 python -m agent_core run app.py --strategy auto --provider kimi --model kimi-k2.5
 python -m agent_core bench --provider kimi --model kimi-k2.5
@@ -113,6 +113,8 @@ python -m agent_core bench --provider kimi --model kimi-k2.5
 | `kimi` | `https://api.moonshot.ai/anthropic` | `MOONSHOT_API_KEY` |
 | `kimi-cn` | `https://api.moonshot.cn/anthropic` | `MOONSHOT_API_KEY` |
 | `compat` | o que você passar em `--base-url` | `--api-key-env` (padrão `LLM_API_KEY`) |
+
+As credenciais vêm só do ambiente. A CLI carrega automaticamente o `.env` da raiz do projeto (ou o caminho em `--env-file`), sem sobrescrever variáveis já exportadas e registrando apenas os **nomes** das variáveis, nunca os valores. Nunca commite o `.env`; se uma chave for exposta, revogue-a e gere outra.
 
 Confirme o ID do modelo no console do provedor e passe com `--model`; o padrão de cada preset é só um ponto de partida. Presets marcados como `compat` enviam apenas o subconjunto universal da API Messages, então **não** valem nesses endpoints: thinking adaptativo, `--effort` e o mapa `effort_by_error`, saída estruturada por JSON Schema (a resposta volta como texto e é lida pelo parser JSON), `cache_control` e o fallback server-side por recusa. O que continua valendo: ferramentas, imagens, retries com backoff, cadeia de `--fallback-model`, memória, checkpoints e rollback.
 

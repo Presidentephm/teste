@@ -21,7 +21,7 @@ from pathlib import Path
 
 from .agent_loop import SelfImprovementAgent
 from .code_manager import CodeManager
-from .config import AgentConfig
+from .config import AgentConfig, load_env_file
 from .memory import AgentMemory
 from .providers import PROVIDER_PRESETS, FakeProvider, ModelMessage, ModelProvider, ModelRequest, ProviderError, build_provider
 from .strategies import AutoStrategy, ClaudeFixStrategy, FixStrategy, HeuristicFixStrategy
@@ -74,6 +74,7 @@ def make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="agent_core", description="Núcleo do agente autônomo multimodal")
     p.add_argument("--root", default=".", help="raiz do projeto (padrão: diretório atual)")
     p.add_argument("--log-level", default="INFO")
+    p.add_argument("--env-file", default=None, help="arquivo com as credenciais (padrão: <root>/.env, se existir)")
     sub = p.add_subparsers(dest="command", required=True)
 
     run = sub.add_parser("run", help="executa o ciclo autônomo sobre um script")
@@ -262,6 +263,14 @@ async def _cmd_memory(ns: argparse.Namespace) -> int:
 
 async def _main(argv: list[str]) -> int:
     ns = make_parser().parse_args(argv)
+    # Credenciais só do ambiente; o .env é uma conveniência local e não
+    # sobrescreve variáveis já exportadas.
+    env_path = Path(ns.env_file) if ns.env_file else Path(ns.root) / ".env"
+    loaded = load_env_file(env_path)
+    if loaded:
+        print(f"-- {env_path}: {', '.join(loaded)} carregadas", file=sys.stderr)
+    elif ns.env_file and not env_path.is_file():
+        print(f"-- aviso: {env_path} não encontrado", file=sys.stderr)
     if ns.command == "run":
         return await _cmd_run(ns)
     if ns.command == "observe":
