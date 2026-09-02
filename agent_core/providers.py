@@ -194,6 +194,9 @@ class ProviderPreset:
         api_key_env: variável de ambiente que guarda a credencial.
         default_model: modelo usado quando o usuário não especifica um.
         compat: envia apenas o subconjunto universal da API Messages.
+        kind: ``"messages"`` (SDK anthropic) ou ``"openai"`` (SDK openai).
+        key_prefix: prefixo que a credencial precisa ter (ex.: ``nvapi-``);
+            é acrescentado se estiver faltando na variável de ambiente.
         docs: página de referência do provedor.
     """
 
@@ -201,6 +204,8 @@ class ProviderPreset:
     api_key_env: str = "ANTHROPIC_API_KEY"
     default_model: str = "claude-opus-5"
     compat: bool = False
+    kind: str = "messages"
+    key_prefix: str = ""
     docs: str = "https://docs.anthropic.com"
 
 
@@ -223,8 +228,21 @@ PROVIDER_PRESETS: dict[str, ProviderPreset] = {
         compat=True,
         docs="https://platform.moonshot.cn/docs",
     ),
-    # Genérico: informe --base-url e --api-key-env você mesmo.
+    # NVIDIA NIM (catálogo do build.nvidia.com) — API compatível com OpenAI,
+    # hospeda modelos de terceiros como moonshotai/kimi-k3.
+    "nvidia": ProviderPreset(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key_env="NVIDIA_API_KEY",
+        default_model="moonshotai/kimi-k3",
+        compat=True,
+        kind="openai",
+        key_prefix="nvapi-",
+        docs="https://build.nvidia.com",
+    ),
+    # Genérico compatível com a API Messages: informe --base-url e --api-key-env.
     "compat": ProviderPreset(api_key_env="LLM_API_KEY", default_model="", compat=True),
+    # Genérico compatível com a API OpenAI (chat completions).
+    "openai-compat": ProviderPreset(api_key_env="LLM_API_KEY", default_model="", compat=True, kind="openai"),
 }
 
 
@@ -794,6 +812,28 @@ def build_provider(config: Any) -> ModelProvider:
     preset = PROVIDER_PRESETS.get(config.llm_provider)
     if preset is None:
         raise ValueError(f"provider desconhecido: {config.llm_provider} (opções: {', '.join(sorted(PROVIDER_PRESETS))})")
+    model = config.llm_model or preset.default_model
+    if not model:
+        raise ValueError(f"o provider '{config.llm_provider}' não tem modelo padrão: informe --model")
+
+    if preset.kind == "openai":
+        from .openai_provider import OpenAICompatProvider
+
+        oa_common: dict[str, Any] = dict(
+            base_url=config.llm_base_url or preset.base_url,
+            api_key_env=config.llm_api_key_env or preset.api_key_env,
+            key_prefix=preset.key_prefix,
+            max_tokens=config.llm_max_tokens,
+            timeout=config.llm_timeout,
+        )
+        oa_primary = OpenAICompatProvider(model=model, **oa_common)
+        if not config.llm_enable_fallbacks:
+            return oa_primary
+        oa_chain: list[ModelProvider] = [oa_primary]
+        for fallback_model in config.llm_fallback_models:
+            oa_chain.append(OpenAICompatProvider(model=fallback_model, **oa_common))
+        return FallbackProvider(oa_chain, max_retries=config.llm_max_retries)
+
     common: dict[str, Any] = dict(
         max_tokens=config.llm_max_tokens,
         effort=config.llm_effort,
@@ -803,9 +843,6 @@ def build_provider(config: Any) -> ModelProvider:
         api_key_env=config.llm_api_key_env or preset.api_key_env,
         compat=preset.compat,
     )
-    model = config.llm_model or preset.default_model
-    if not model:
-        raise ValueError(f"o provider '{config.llm_provider}' não tem modelo padrão: informe --model")
     primary = AnthropicProvider(model=model, server_fallbacks=config.llm_enable_fallbacks, **common)
     if not config.llm_enable_fallbacks:
         return primary

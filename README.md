@@ -73,7 +73,8 @@ pip install -r requirements.txt
 
 | Dependência | Uso | Obrigatória? |
 | --- | --- | --- |
-| `anthropic>=1.3` | `AnthropicProvider` (SDK oficial). Testado com 1.3.0. | Só para usar o modelo |
+| `anthropic>=1.3` | `AnthropicProvider` (SDK oficial). Testado com 1.3.0. | Só para endpoints no formato Messages |
+| `openai>=2` | `OpenAICompatProvider` (NVIDIA NIM e afins). Testado com 3.7.0. | Só para `--provider nvidia` / `openai-compat` |
 | `opencv-python-headless`, `numpy` | Subsistema de visão | Só com `--vision` |
 | `mss` | `ScreenSource` (captura de tela) | Opcional |
 | `pytesseract` + binário `tesseract` (`apt install tesseract-ocr`) | OCR real no pipeline visual; a estratégia lê mensagens de erro na tela | Opcional; sem eles `text=None`, `ocr="unavailable"`; `vision_ocr=False` desliga |
@@ -96,12 +97,20 @@ O núcleo (backup, AST, sandbox, heurística, memória, contexto) usa só a bibl
 - **Cache de prompt** (`--no-cache` desliga): o prefixo estável (ferramentas + sistema) recebe `cache_control`; o conteúdo variável fica depois do breakpoint.
 - **Uso e custo**: cada provider acumula chamadas, tokens (entrada, saída, cache) e custo estimado pela tabela de preços por modelo; o relatório do `run` e o `bench` mostram o delta.
 
-## Outros provedores (endpoint compatível com a API Messages)
+## Outros provedores
 
-O `ModelProvider` existe justamente para trocar o backend sem tocar nas estratégias nem no loop. Provedores que expõem um endpoint no formato Messages funcionam reaproveitando todo o código — inclusive loop de ferramentas, imagens, normalização de erros e contabilidade de uso.
+O `ModelProvider` existe justamente para trocar o backend sem tocar nas estratégias nem no loop. Há duas implementações, escolhidas pelo preset:
+
+- **`AnthropicProvider`** (`agent_core/providers.py`) para endpoints no formato **Messages** — a API da Anthropic e compatíveis, como a Moonshot em `/anthropic`.
+- **`OpenAICompatProvider`** (`agent_core/openai_provider.py`) para endpoints no formato **chat completions** da OpenAI — entre eles a **NVIDIA NIM** (catálogo do [build.nvidia.com](https://build.nvidia.com)), que hospeda modelos de terceiros como `moonshotai/kimi-k3`.
+
+Os dois falam os mesmos `ModelRequest`/`ModelResponse`/`ProviderError`, então estratégias, loop de ferramentas, imagens, memória e contabilidade de uso funcionam igual nos dois caminhos.
 
 ```bash
 cp .env.example .env      # preencha a chave; o .env é ignorado pelo Git
+python -m agent_core providers                 # quais endpoints existem e o que está configurado
+python -m agent_core providers --probe --provider nvidia   # valida a credencial
+python -m agent_core run app.py --strategy auto --provider nvidia   # kimi-k3 via NVIDIA
 python -m agent_core ask "diga olá" --provider kimi
 python -m agent_core run app.py --strategy auto --provider kimi --model kimi-k2.5
 python -m agent_core bench --provider kimi --model kimi-k2.5
@@ -112,13 +121,17 @@ python -m agent_core bench --provider kimi --model kimi-k2.5
 | `anthropic` (padrão) | `api.anthropic.com` | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / perfil `ant auth login` |
 | `kimi` | `https://api.moonshot.ai/anthropic` | `MOONSHOT_API_KEY` |
 | `kimi-cn` | `https://api.moonshot.cn/anthropic` | `MOONSHOT_API_KEY` |
-| `compat` | o que você passar em `--base-url` | `--api-key-env` (padrão `LLM_API_KEY`) |
+| `nvidia` | `https://integrate.api.nvidia.com/v1` (OpenAI) | `NVIDIA_API_KEY` (prefixo `nvapi-` acrescentado se faltar) |
+| `compat` | o que você passar em `--base-url` (Messages) | `--api-key-env` (padrão `LLM_API_KEY`) |
+| `openai-compat` | o que você passar em `--base-url` (OpenAI) | `--api-key-env` (padrão `LLM_API_KEY`) |
 
 `python -m agent_core providers` lista os presets e mostra quais credenciais estão definidas; `providers --probe --provider X` faz uma chamada mínima e diagnostica o erro (`auth`, `bad_request`, `unavailable`) sem expor a chave.
 
 O padrão do preset `kimi` é `kimi-k3` (modelo multimodal de 1M de contexto da Moonshot, jul/2026; US$3,00 por milhão de tokens de entrada e US$15,00 de saída, com leitura de cache a US$0,30 — já refletido na estimativa de custo). Chaves oficiais são criadas em `platform.kimi.ai/console/api-keys` e exigem crédito na conta; chaves de gateways de terceiros (OpenRouter e outros que revendem o K3) têm outra base URL e outro formato, e nesse caso use `--provider compat --base-url ... --api-key-env ...`.
 
-O K3 é sensível ao histórico de raciocínio: se o arcabouço descarta os blocos de *thinking* entre turnos, a qualidade cai. O loop de ferramentas daqui reenvia o turno do assistente com o conteúdo bruto do SDK, preservando esses blocos — há teste de regressão para isso (`ThinkingHistoryTests`).
+Nos endpoints OpenAI o custo não é estimado quando o ID do modelo não está em `MODEL_PRICES` — os preços do revendedor diferem dos da Moonshot, então o relatório marca `priced: false` em vez de inventar um valor.
+
+O K3 é sensível ao histórico de raciocínio: se o arcabouço descarta os blocos de *thinking* entre turnos, a qualidade cai. O loop de ferramentas daqui reenvia o turno do assistente com o conteúdo bruto do SDK, preservando esses blocos — há teste de regressão para isso nos dois providers (`ThinkingHistoryTests` e o reenvio de `reasoning_content` em `test_openai_provider.py`).
 
 As credenciais vêm só do ambiente. A CLI carrega automaticamente o `.env` da raiz do projeto (ou o caminho em `--env-file`), sem sobrescrever variáveis já exportadas e registrando apenas os **nomes** das variáveis, nunca os valores. Nunca commite o `.env`; se uma chave for exposta, revogue-a e gere outra.
 
@@ -215,7 +228,7 @@ Extensão: `AutoStrategy(provider, analyzers=[...], planners=[...])` aceita qual
 python -m unittest discover -s tests -v
 ```
 
-Suítes: `test_agent_core.py` (23 originais), `test_providers.py`, `test_vision.py`, `test_multimodal.py`, `test_auto_strategy.py`, `test_loop_v2.py`, `test_memory_safety.py`, `test_tools_and_bench.py`. Todas determinísticas (fakes/mocks); chamadas reais ao modelo ficam fora da suíte (`examples/provider_call.py`, `ask`, `bench` sem `--offline`). O workflow `.github/workflows/tests.yml` roda a suíte e o benchmark offline em Python 3.10–3.12.
+Suítes: `test_agent_core.py` (23 originais), `test_providers.py`, `test_openai_provider.py`, `test_vision.py`, `test_multimodal.py`, `test_auto_strategy.py`, `test_loop_v2.py`, `test_memory_safety.py`, `test_tools_and_bench.py`. Todas determinísticas (fakes/mocks); chamadas reais ao modelo ficam fora da suíte (`examples/provider_call.py`, `ask`, `bench` sem `--offline`). O workflow `.github/workflows/tests.yml` roda a suíte e o benchmark offline em Python 3.10–3.12.
 
 ## Exemplos (`examples/`)
 

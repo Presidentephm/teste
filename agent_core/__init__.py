@@ -57,6 +57,7 @@ from .providers import (
     UsageTracker,
     build_provider,
 )
+from .openai_provider import OpenAICompatProvider
 from .tools import ProjectToolbox, PATCH_SCHEMA
 from .observations import (
     Observation,
@@ -98,7 +99,7 @@ __all__ = [
     "ModelMessage", "ContentPart", "ProviderError", "ProviderAuthError", "ProviderRateLimitError",
     "ProviderTimeoutError", "ProviderUnavailableError", "ProviderInvalidResponseError", "ProviderRefusalError",
     "ProviderRequestError", "ProviderInterrupted", "ToolSpec", "ToolCall", "UsageTracker", "build_provider",
-    "ProjectToolbox", "PATCH_SCHEMA", "ToolFixStrategy",
+    "ProjectToolbox", "PATCH_SCHEMA", "ToolFixStrategy", "OpenAICompatProvider",
     "Observation", "ObservationKind", "ImageData", "MultimodalContext", "ContextLimits", "Observer",
     "RuntimeObserver", "TestObserver", "LogObserver", "CodeObserver",
     "AgentMemory", "MemoryEntry", "patch_signature",

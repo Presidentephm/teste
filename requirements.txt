@@ -1,6 +1,10 @@
 # Núcleo (backup, AST, sandbox, heurística, memória, contexto): só biblioteca padrão.
 # SDK oficial (ClaudeFixStrategy / AnthropicProvider). Testado com 1.3.0.
 anthropic>=1.3
+# SDK OpenAI: providers compatíveis com chat completions (NVIDIA NIM e afins).
+# Testado com 3.7.0. Só é necessário para --provider nvidia / openai-compat.
+openai>=2
+
 # Visão (OpenCV + numpy). Use opencv-python se precisar de janelas/GUI.
 opencv-python-headless>=4.10
 numpy>=1.26

@@ -235,19 +235,20 @@ async def _cmd_providers(ns: argparse.Namespace) -> int:
     for name, preset in sorted(PROVIDER_PRESETS.items()):
         rows.append({
             "preset": name,
-            "endpoint": preset.base_url or "api.anthropic.com",
+            "endpoint": preset.base_url or ("api.anthropic.com" if preset.kind == "messages" else "(informe --base-url)"),
             "credencial": preset.api_key_env,
             "definida": bool(os.environ.get(preset.api_key_env)),
             "modelo_padrao": preset.default_model or "(informe --model)",
+            "api": "messages" if preset.kind == "messages" else "openai",
             "compat": preset.compat,
         })
     if not ns.probe:
         if ns.json:
             print(json.dumps(rows, indent=2, ensure_ascii=False))
         else:
-            print(f"{'preset':<10} {'endpoint':<38} {'credencial':<20} {'definida':<9} modelo padrão")
+            print(f"{'preset':<14} {'api':<9} {'endpoint':<40} {'credencial':<20} {'definida':<9} modelo padrão")
             for r in rows:
-                print(f"{r['preset']:<10} {r['endpoint']:<38} {r['credencial']:<20} {str(r['definida']):<9} {r['modelo_padrao']}")
+                print(f"{r['preset']:<14} {r['api']:<9} {r['endpoint']:<40} {r['credencial']:<20} {str(r['definida']):<9} {r['modelo_padrao']}")
             print("\nUse --probe para testar a credencial do provider escolhido.")
         return 0
 
