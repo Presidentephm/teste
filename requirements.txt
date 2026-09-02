@@ -1,0 +1,3 @@
+# O núcleo (backup, AST, sandbox, heurística) usa apenas a biblioteca padrão.
+# O SDK abaixo é necessário somente para a ClaudeFixStrategy.
+anthropic>=0.80
