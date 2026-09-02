@@ -64,7 +64,7 @@ class CompatRequestTests(unittest.TestCase):
         for forbidden in ("thinking", "output_config", "betas", "fallbacks"):
             self.assertNotIn(forbidden, kw)
         self.assertEqual(kw["system"], "sys")  # string simples, sem cache_control
-        self.assertEqual(kw["model"], "kimi-k2-turbo-preview")
+        self.assertEqual(kw["model"], "kimi-k3")
         self.assertEqual(kw["tools"][0]["name"], "read_file")          # ferramentas continuam
         self.assertEqual(kw["messages"][0]["content"][1]["type"], "image")  # imagens continuam
 
@@ -119,7 +119,7 @@ class FactoryTests(TempProject):
         p = build_provider(cfg)
         self.assertIsInstance(p, FallbackProvider)
         head = p.providers[0]
-        self.assertEqual(head.model, "kimi-k2-turbo-preview")  # modelo padrão do preset
+        self.assertEqual(head.model, "kimi-k3")  # modelo padrão do preset
         self.assertTrue(head.compat)
         self.assertFalse(p.supports_structured_output)
 
@@ -180,3 +180,53 @@ class EnvFileTests(TempProject):
         from agent_core.config import load_env_file
 
         self.assertEqual(load_env_file(self.root / "nao-existe.env"), [])
+
+
+class ThinkingHistoryTests(TempProject):
+    """K3 degrada se o histórico de raciocínio for descartado entre turnos.
+
+    O turno do assistente é reenviado com o conteúdo bruto do SDK (incluindo
+    blocos ``thinking``), nunca remontado a partir do texto extraído.
+    """
+
+    def test_tool_loop_replays_thinking_blocks(self):
+        from types import SimpleNamespace
+
+        from agent_core import CodeManager
+
+        self.write("app.py", "print(json.dumps({}))\n")
+        thinking = SimpleNamespace(type="thinking", thinking="preciso ver o arquivo")
+        tool_use = SimpleNamespace(type="tool_use", id="c1", name="list_files", input={})
+        first = fake_message("", stop_reason="tool_use")
+        first.content = [thinking, tool_use]
+        second = fake_message('{"rationale": "faltou import", "confidence": 0.9, "patches": [{"path": "app.py", "mode": "search_replace", "replacements": [{"search": "print(", "replace": "import json\\nprint("}]}]}')
+
+        class _TwoTurnClient(FakeAnthropicClient):
+            def __init__(self, messages):
+                super().__init__(messages[0])
+                self._queue = list(messages)
+                outer = self
+
+                class _Messages:
+                    def __init__(self, beta):
+                        self.beta = beta
+
+                    def stream(self, **kwargs):
+                        (outer.beta_calls if self.beta else outer.calls).append(kwargs)
+                        from tests._helpers import FakeStream
+
+                        return FakeStream(outer._queue.pop(0))
+
+                self.messages = _Messages(False)
+                self.beta = SimpleNamespace(messages=_Messages(True))
+
+        client = _TwoTurnClient([first, second])
+        provider = AnthropicProvider.from_preset("kimi", client=client)
+        ctx = self.failure_context("app.py", code_manager=CodeManager(self.config))
+        proposal = run(ToolFixStrategy(provider).propose(ctx))
+        self.assertIsNotNone(proposal)
+        replayed = client.calls[1]["messages"][1]
+        self.assertEqual(replayed["role"], "assistant")
+        self.assertIs(replayed["content"], first.content)          # objeto original, sem remontagem
+        self.assertIn(thinking, replayed["content"])                # bloco de raciocínio preservado
+        self.assertEqual(client.calls[1]["messages"][2]["content"][0]["type"], "tool_result")

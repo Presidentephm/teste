@@ -114,6 +114,12 @@ python -m agent_core bench --provider kimi --model kimi-k2.5
 | `kimi-cn` | `https://api.moonshot.cn/anthropic` | `MOONSHOT_API_KEY` |
 | `compat` | o que você passar em `--base-url` | `--api-key-env` (padrão `LLM_API_KEY`) |
 
+`python -m agent_core providers` lista os presets e mostra quais credenciais estão definidas; `providers --probe --provider X` faz uma chamada mínima e diagnostica o erro (`auth`, `bad_request`, `unavailable`) sem expor a chave.
+
+O padrão do preset `kimi` é `kimi-k3` (modelo multimodal de 1M de contexto da Moonshot, jul/2026; US$3,00 por milhão de tokens de entrada e US$15,00 de saída, com leitura de cache a US$0,30 — já refletido na estimativa de custo). Chaves oficiais são criadas em `platform.kimi.ai/console/api-keys` e exigem crédito na conta; chaves de gateways de terceiros (OpenRouter e outros que revendem o K3) têm outra base URL e outro formato, e nesse caso use `--provider compat --base-url ... --api-key-env ...`.
+
+O K3 é sensível ao histórico de raciocínio: se o arcabouço descarta os blocos de *thinking* entre turnos, a qualidade cai. O loop de ferramentas daqui reenvia o turno do assistente com o conteúdo bruto do SDK, preservando esses blocos — há teste de regressão para isso (`ThinkingHistoryTests`).
+
 As credenciais vêm só do ambiente. A CLI carrega automaticamente o `.env` da raiz do projeto (ou o caminho em `--env-file`), sem sobrescrever variáveis já exportadas e registrando apenas os **nomes** das variáveis, nunca os valores. Nunca commite o `.env`; se uma chave for exposta, revogue-a e gere outra.
 
 Confirme o ID do modelo no console do provedor e passe com `--model`; o padrão de cada preset é só um ponto de partida. Presets marcados como `compat` enviam apenas o subconjunto universal da API Messages, então **não** valem nesses endpoints: thinking adaptativo, `--effort` e o mapa `effort_by_error`, saída estruturada por JSON Schema (a resposta volta como texto e é lida pelo parser JSON), `cache_control` e o fallback server-side por recusa. O que continua valendo: ferramentas, imagens, retries com backoff, cadeia de `--fallback-model`, memória, checkpoints e rollback.

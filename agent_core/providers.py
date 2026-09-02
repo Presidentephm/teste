@@ -178,6 +178,7 @@ MODEL_PRICES: dict[str, tuple[float, float]] = {
     "claude-sonnet-4-6": (3.0, 15.0),
     "claude-haiku-4-5": (1.0, 5.0),
     # Moonshot/Kimi (confira valores atuais no console do provedor).
+    "kimi-k3": (3.0, 15.0),
     "kimi-k2": (0.6, 2.5),
     "kimi-latest": (0.6, 2.5),
     "moonshot-v1": (0.6, 2.5),
@@ -211,14 +212,14 @@ PROVIDER_PRESETS: dict[str, ProviderPreset] = {
     "kimi": ProviderPreset(
         base_url="https://api.moonshot.ai/anthropic",
         api_key_env="MOONSHOT_API_KEY",
-        default_model="kimi-k2-turbo-preview",
+        default_model="kimi-k3",
         compat=True,
         docs="https://platform.kimi.ai/docs/api/overview",
     ),
     "kimi-cn": ProviderPreset(
         base_url="https://api.moonshot.cn/anthropic",
         api_key_env="MOONSHOT_API_KEY",
-        default_model="kimi-k2-turbo-preview",
+        default_model="kimi-k3",
         compat=True,
         docs="https://platform.moonshot.cn/docs",
     ),
@@ -762,6 +763,23 @@ class FakeProvider(ModelProvider):
         text = str(item)
         self._usage.record(self.model, {"input_tokens": 100, "output_tokens": 50}, 0.0)
         return ModelResponse(text=text, model=self.model, stop_reason="end_turn", parts=[ContentPart.from_text(text)])
+
+
+# --------------------------------------------------------------------- probe
+async def probe_provider(provider: ModelProvider) -> dict[str, Any]:
+    """Faz uma chamada mínima para diagnosticar credencial e endpoint.
+
+    Nunca levanta: devolve ``{"ok": bool, "code": str, "detail": str, ...}``
+    com o erro já normalizado, para a CLI mostrar um diagnóstico claro sem
+    expor a credencial.
+    """
+    info = provider.describe()
+    request = ModelRequest(messages=[ModelMessage.user("ping")], max_tokens=16, effort="low")
+    try:
+        response = await provider.complete(request)
+    except ProviderError as exc:
+        return {**info, "ok": False, "code": exc.code, "detail": str(exc)}
+    return {**info, "ok": True, "code": "ok", "detail": f"respondeu como {response.model}", "answer": response.text[:120]}
 
 
 # ------------------------------------------------------------------- fábrica

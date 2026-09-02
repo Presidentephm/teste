@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -23,7 +24,7 @@ from .agent_loop import SelfImprovementAgent
 from .code_manager import CodeManager
 from .config import AgentConfig, load_env_file
 from .memory import AgentMemory
-from .providers import PROVIDER_PRESETS, FakeProvider, ModelMessage, ModelProvider, ModelRequest, ProviderError, build_provider
+from .providers import PROVIDER_PRESETS, FakeProvider, ModelMessage, ModelProvider, ModelRequest, ProviderError, build_provider, probe_provider
 from .strategies import AutoStrategy, ClaudeFixStrategy, FixStrategy, HeuristicFixStrategy
 
 
@@ -117,6 +118,11 @@ def make_parser() -> argparse.ArgumentParser:
 
     mem = sub.add_parser("memory", help="mostra ou limpa a memória persistida")
     mem.add_argument("--clear", action="store_true")
+
+    prov = sub.add_parser("providers", help="lista os endpoints suportados e testa a credencial")
+    prov.add_argument("--probe", action="store_true", help="faz uma chamada mínima para validar credencial e modelo")
+    prov.add_argument("--json", action="store_true")
+    _add_model_args(prov)
 
     bench = sub.add_parser("bench", help="benchmark: taxa de correção, iterações, tokens e custo")
     bench.add_argument("--strategy", choices=["auto", "heuristic"], default="auto")
@@ -224,6 +230,49 @@ async def _cmd_ask(ns: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_providers(ns: argparse.Namespace) -> int:
+    rows = []
+    for name, preset in sorted(PROVIDER_PRESETS.items()):
+        rows.append({
+            "preset": name,
+            "endpoint": preset.base_url or "api.anthropic.com",
+            "credencial": preset.api_key_env,
+            "definida": bool(os.environ.get(preset.api_key_env)),
+            "modelo_padrao": preset.default_model or "(informe --model)",
+            "compat": preset.compat,
+        })
+    if not ns.probe:
+        if ns.json:
+            print(json.dumps(rows, indent=2, ensure_ascii=False))
+        else:
+            print(f"{'preset':<10} {'endpoint':<38} {'credencial':<20} {'definida':<9} modelo padrão")
+            for r in rows:
+                print(f"{r['preset']:<10} {r['endpoint']:<38} {r['credencial']:<20} {str(r['definida']):<9} {r['modelo_padrao']}")
+            print("\nUse --probe para testar a credencial do provider escolhido.")
+        return 0
+
+    config = config_from_args(ns)
+    provider = build_provider(config)
+    try:
+        result = await probe_provider(provider)
+    finally:
+        await provider.aclose()
+    if ns.json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        head = result.get("chain", [result])[0] if "chain" in result else result
+        print(f"endpoint : {head.get('endpoint', '-')}")
+        print(f"modelo   : {head.get('model', '-')}")
+        print(f"resultado: {'OK' if result['ok'] else 'FALHOU'} [{result['code']}]")
+        print(f"detalhe  : {result['detail']}")
+        if not result["ok"]:
+            print("\nDicas por código:")
+            print("  auth        -> chave ausente, inválida ou de outro provedor; confira onde ela foi criada")
+            print("  bad_request -> modelo inexistente nessa conta: ajuste --model")
+            print("  unavailable -> rede/proxy bloqueando ou serviço fora do ar")
+    return 0 if result["ok"] else 1
+
+
 async def _cmd_bench(ns: argparse.Namespace) -> int:
     from . import bench as B
 
@@ -281,6 +330,8 @@ async def _main(argv: list[str]) -> int:
         return await _cmd_memory(ns)
     if ns.command == "bench":
         return await _cmd_bench(ns)
+    if ns.command == "providers":
+        return await _cmd_providers(ns)
 
     config = AgentConfig(project_root=Path(ns.root), log_level=ns.log_level)
     code = CodeManager(config)
