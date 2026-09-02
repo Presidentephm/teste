@@ -23,7 +23,7 @@ from .agent_loop import SelfImprovementAgent
 from .code_manager import CodeManager
 from .config import AgentConfig
 from .memory import AgentMemory
-from .providers import FakeProvider, ModelMessage, ModelProvider, ModelRequest, ProviderError, build_provider
+from .providers import PROVIDER_PRESETS, FakeProvider, ModelMessage, ModelProvider, ModelRequest, ProviderError, build_provider
 from .strategies import AutoStrategy, ClaudeFixStrategy, FixStrategy, HeuristicFixStrategy
 
 
@@ -55,7 +55,10 @@ def _add_vision_args(p: argparse.ArgumentParser) -> None:
 
 def _add_model_args(p: argparse.ArgumentParser) -> None:
     g = p.add_argument_group("modelo")
-    g.add_argument("--model", default="claude-opus-5")
+    g.add_argument("--provider", default="anthropic", choices=sorted(PROVIDER_PRESETS), help="endpoint compatível com a API Messages (kimi = Moonshot)")
+    g.add_argument("--base-url", default=None, help="sobrescreve a base URL do provider")
+    g.add_argument("--api-key-env", default=None, help="variável de ambiente com a credencial (ex.: MOONSHOT_API_KEY)")
+    g.add_argument("--model", default=None, help="ID do modelo (padrão: o do provider escolhido)")
     g.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"])
     g.add_argument("--max-tokens", type=int, default=16000)
     g.add_argument("--fallback", dest="fallback", action="store_true", default=True, help="ativa retries/fallback (padrão)")
@@ -126,9 +129,13 @@ def make_parser() -> argparse.ArgumentParser:
 
 def config_from_args(ns: argparse.Namespace) -> AgentConfig:
     kwargs: dict = dict(project_root=Path(ns.root), log_level=ns.log_level)
-    if getattr(ns, "model", None):
+    if hasattr(ns, "provider"):
+        preset = PROVIDER_PRESETS[ns.provider]
         kwargs.update(
-            llm_model=ns.model,
+            llm_provider=ns.provider,
+            llm_base_url=ns.base_url,
+            llm_api_key_env=ns.api_key_env,
+            llm_model=ns.model or preset.default_model,
             llm_effort=ns.effort,
             llm_max_tokens=ns.max_tokens,
             llm_enable_fallbacks=ns.fallback,
@@ -194,6 +201,10 @@ async def _cmd_ask(ns: argparse.Namespace) -> int:
 
     config = config_from_args(ns)
     provider: ModelProvider = FakeProvider([f"(fake) recebi {len(ns.prompt)} caracteres e {len(ns.image)} imagens"]) if ns.fake else build_provider(config)
+    if not ns.fake:
+        info = provider.describe()
+        head = info["chain"][0] if "chain" in info else info
+        print(f"-- modelo={head['model']} endpoint={head.get('endpoint', '-')} compat={head.get('compat', False)}", file=sys.stderr)
     parts = [ContentPart.from_text(ns.prompt)]
     for path in ns.image:
         data = Path(path).read_bytes()

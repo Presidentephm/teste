@@ -140,7 +140,9 @@ class ScreenSource(VisualSource):
         except ImportError as exc:
             raise VisionUnavailableError("captura de tela requer 'mss' (pip install mss)") from exc
         try:
-            self._sct = mss.mss()
+            # mss.MSS a partir da 10.x; mss.mss() nas versões anteriores.
+            factory = getattr(mss, "MSS", None) or mss.mss
+            self._sct = factory()
             monitors = self._sct.monitors
             if self.monitor >= len(monitors):
                 raise VisionUnavailableError(f"monitor {self.monitor} inexistente ({len(monitors) - 1} disponíveis)")

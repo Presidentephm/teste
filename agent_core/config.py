@@ -78,6 +78,9 @@ class AgentConfig:
     protected_paths: tuple[str, ...] = (".git",)
     allow_self_modification: bool = True
     log_level: str = "INFO"
+    llm_provider: str = "anthropic"    # anthropic | kimi | kimi-cn | compat (ver providers.PROVIDER_PRESETS)
+    llm_base_url: str | None = None    # sobrescreve a base URL do preset
+    llm_api_key_env: str | None = None # variável de ambiente com a credencial
     llm_model: str = "claude-opus-5"
     llm_effort: str = "high"
     llm_max_tokens: int = 16000
@@ -139,6 +142,8 @@ class AgentConfig:
                 raise ValueError(f"effort_by_error[{key!r}] inválido: {value}")
         if self.llm_max_tool_rounds < 1:
             raise ValueError("llm_max_tool_rounds deve ser >= 1")
+        if self.llm_base_url is not None and not str(self.llm_base_url).startswith(("http://", "https://")):
+            raise ValueError("llm_base_url deve começar com http:// ou https://")
         self.test_command = tuple(self.test_command) if self.test_command else None
         self.llm_fallback_models = tuple(self.llm_fallback_models)
         self.vision_images = tuple(str(p) for p in self.vision_images)

@@ -96,6 +96,26 @@ O núcleo (backup, AST, sandbox, heurística, memória, contexto) usa só a bibl
 - **Cache de prompt** (`--no-cache` desliga): o prefixo estável (ferramentas + sistema) recebe `cache_control`; o conteúdo variável fica depois do breakpoint.
 - **Uso e custo**: cada provider acumula chamadas, tokens (entrada, saída, cache) e custo estimado pela tabela de preços por modelo; o relatório do `run` e o `bench` mostram o delta.
 
+## Outros provedores (endpoint compatível com a API Messages)
+
+O `ModelProvider` existe justamente para trocar o backend sem tocar nas estratégias nem no loop. Provedores que expõem um endpoint no formato Messages funcionam reaproveitando todo o código — inclusive loop de ferramentas, imagens, normalização de erros e contabilidade de uso.
+
+```bash
+export MOONSHOT_API_KEY='sk-...'
+python -m agent_core ask "diga olá" --provider kimi
+python -m agent_core run app.py --strategy auto --provider kimi --model kimi-k2.5
+python -m agent_core bench --provider kimi --model kimi-k2.5
+```
+
+| Preset | Endpoint | Credencial |
+| --- | --- | --- |
+| `anthropic` (padrão) | `api.anthropic.com` | `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / perfil `ant auth login` |
+| `kimi` | `https://api.moonshot.ai/anthropic` | `MOONSHOT_API_KEY` |
+| `kimi-cn` | `https://api.moonshot.cn/anthropic` | `MOONSHOT_API_KEY` |
+| `compat` | o que você passar em `--base-url` | `--api-key-env` (padrão `LLM_API_KEY`) |
+
+Confirme o ID do modelo no console do provedor e passe com `--model`; o padrão de cada preset é só um ponto de partida. Presets marcados como `compat` enviam apenas o subconjunto universal da API Messages, então **não** valem nesses endpoints: thinking adaptativo, `--effort` e o mapa `effort_by_error`, saída estruturada por JSON Schema (a resposta volta como texto e é lida pelo parser JSON), `cache_control` e o fallback server-side por recusa. O que continua valendo: ferramentas, imagens, retries com backoff, cadeia de `--fallback-model`, memória, checkpoints e rollback.
+
 ## Visão
 
 ```
@@ -137,6 +157,7 @@ python -m agent_core run app.py --strategy auto --vision --vision-source image \
 | `--max-iterations`, `--max-retries`, `--timeout`, `--total-timeout` | 5, 3, 30 s, ∞ | Limites do ciclo. |
 | `--tests "…"`, `--tests-in-place` | — | Comando de testes (após `python`) que também precisa passar; por padrão roda na cópia isolada do projeto. |
 | `--no-tools`, `--max-tool-rounds`, `--no-cache` | ferramentas ligadas, 8, cache ligado | Modo de consulta ao modelo. |
+| `--provider`, `--base-url`, `--api-key-env` | `anthropic` | Endpoint compatível com a API Messages (ver acima). |
 | `--memory-limit`, `--reset-memory` | 100 | Memória do agente. |
 | `--no-self-modify` | — | Proíbe alterar `agent_core/`. |
 | `--json` | — | Relatório em JSON. |
@@ -207,5 +228,6 @@ Suítes: `test_agent_core.py` (23 originais), `test_providers.py`, `test_vision.
 - OCR só existe com Tesseract instalado; sem ele a análise visual é estatística/estrutural.
 - Captura de tela exige display (`mss`); em servidores headless a fonte falha de forma limpa.
 - A heurística cobre imports ausentes, typos de nome e indentação; o restante depende do modelo.
-- O custo é estimado por uma tabela de preços embutida (`MODEL_PRICES`); modelos fora dela aparecem como não precificados.
+- O custo é estimado por uma tabela de preços embutida (`MODEL_PRICES`); modelos fora dela aparecem como não precificados, e os valores de terceiros precisam ser conferidos no console do provedor.
+- Os presets compatíveis foram implementados a partir da documentação pública do provedor e cobertos por testes com cliente falso; a validação contra o endpoint real depende de uma credencial.
 - A validação com o modelo real depende de credenciais no ambiente; o harness (`bench`) está pronto, mas os números reais precisam ser medidos pelo usuário.

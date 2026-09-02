@@ -347,6 +347,16 @@ class ModelFixStrategy(FixStrategy):
         self.last_response: Any = None
 
     # -- prompt
+    def _schema(self) -> dict[str, Any] | None:
+        """JSON Schema do patch, quando a estratégia e o provider o suportam.
+
+        Endpoints compatíveis (ex.: Kimi) não implementam ``output_config``;
+        nesse caso a resposta vem em texto e é lida por ``_extract_json``.
+        """
+        if not self.structured_output or not getattr(self.provider, "supports_structured_output", True):
+            return None
+        return PATCH_SCHEMA
+
     @staticmethod
     def _numbered(source: str) -> str:
         return "\n".join(f"{i:4d} | {line}" for i, line in enumerate(source.splitlines(), 1))
@@ -395,7 +405,7 @@ class ModelFixStrategy(FixStrategy):
             messages=[ModelMessage("user", parts)],
             system=self.system_prompt,
             effort=ctx.effort,
-            output_schema=PATCH_SCHEMA if self.structured_output else None,
+            output_schema=self._schema(),
         )
 
     # -- chamada
@@ -546,6 +556,8 @@ class ToolFixStrategy(ModelFixStrategy):
         toolbox = ProjectToolbox(ctx.code_manager)
         messages = [ModelMessage("user", [ContentPart.from_text(self.build_prompt(ctx, diagnosis))] + self._image_parts(ctx))]
         request = ModelRequest(messages=messages, system=self.system_prompt, tools=toolbox.specs(), effort=ctx.effort)
+        # A proposta chega pela ferramenta propose_patch; o schema de saída
+        # ficaria em conflito com o uso de ferramentas.
         self.last_rounds = 0
         self.last_tool_calls = []
         final_text = ""

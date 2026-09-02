@@ -27,7 +27,19 @@ O identificador de modelo NÃO é validado localmente: a API responde com
 outro ID pode ser configurado via ``AgentConfig.llm_model`` ou ``--model``.
 
 Credenciais: nunca são passadas em código. O SDK lê ``ANTHROPIC_API_KEY`` /
-``ANTHROPIC_AUTH_TOKEN`` ou um perfil de ``ant auth login``.
+``ANTHROPIC_AUTH_TOKEN`` ou um perfil de ``ant auth login``; com um preset de
+outro provedor, a variável de ambiente correspondente (ex.: ``MOONSHOT_API_KEY``).
+
+Provedores compatíveis com a API Messages
+-----------------------------------------
+Alguns provedores expõem um endpoint no formato Anthropic (ex.: Moonshot/Kimi
+em ``https://api.moonshot.ai/anthropic``). ``PROVIDER_PRESETS`` guarda base
+URL, variável de credencial e modelo padrão de cada um; o modo ``compat``
+envia apenas o subconjunto universal da API Messages (model, max_tokens,
+messages, system, tools) e omite o que é exclusivo da Anthropic — thinking
+adaptativo, ``output_config`` (effort e saída estruturada), ``cache_control``
+e o fallback server-side. Todo o resto do sistema (loop de ferramentas,
+imagens, normalização de erros, contabilidade de uso) é reaproveitado.
 """
 
 from __future__ import annotations
@@ -35,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import random
 import time
 from abc import ABC, abstractmethod
@@ -164,6 +177,53 @@ MODEL_PRICES: dict[str, tuple[float, float]] = {
     "claude-sonnet-5": (2.0, 10.0),
     "claude-sonnet-4-6": (3.0, 15.0),
     "claude-haiku-4-5": (1.0, 5.0),
+    # Moonshot/Kimi (confira valores atuais no console do provedor).
+    "kimi-k2": (0.6, 2.5),
+    "kimi-latest": (0.6, 2.5),
+    "moonshot-v1": (0.6, 2.5),
+}
+
+
+@dataclass(frozen=True)
+class ProviderPreset:
+    """Configuração de um endpoint compatível com a API Messages.
+
+    Attributes:
+        base_url: endereço do endpoint (``None`` = API da Anthropic).
+        api_key_env: variável de ambiente que guarda a credencial.
+        default_model: modelo usado quando o usuário não especifica um.
+        compat: envia apenas o subconjunto universal da API Messages.
+        docs: página de referência do provedor.
+    """
+
+    base_url: str | None = None
+    api_key_env: str = "ANTHROPIC_API_KEY"
+    default_model: str = "claude-opus-5"
+    compat: bool = False
+    docs: str = "https://docs.anthropic.com"
+
+
+PROVIDER_PRESETS: dict[str, ProviderPreset] = {
+    "anthropic": ProviderPreset(),
+    # Moonshot AI (Kimi) — endpoint compatível com a API Messages.
+    # O ID do modelo muda a cada geração: confirme o disponível na sua conta
+    # e passe com --model; o padrão abaixo é apenas um ponto de partida.
+    "kimi": ProviderPreset(
+        base_url="https://api.moonshot.ai/anthropic",
+        api_key_env="MOONSHOT_API_KEY",
+        default_model="kimi-k2-turbo-preview",
+        compat=True,
+        docs="https://platform.kimi.ai/docs/api/overview",
+    ),
+    "kimi-cn": ProviderPreset(
+        base_url="https://api.moonshot.cn/anthropic",
+        api_key_env="MOONSHOT_API_KEY",
+        default_model="kimi-k2-turbo-preview",
+        compat=True,
+        docs="https://platform.moonshot.cn/docs",
+    ),
+    # Genérico: informe --base-url e --api-key-env você mesmo.
+    "compat": ProviderPreset(api_key_env="LLM_API_KEY", default_model="", compat=True),
 }
 
 
@@ -326,18 +386,42 @@ class AnthropicProvider(ModelProvider):
         timeout: float = 600.0,
         max_retries: int = 2,
         cache_prompts: bool = True,
+        base_url: str | None = None,
+        api_key_env: str = "ANTHROPIC_API_KEY",
+        compat: bool = False,
         client: Any | None = None,
     ) -> None:
         super().__init__()
         self.model = model
         self.max_tokens = max_tokens
         self.effort = effort
-        self.server_fallbacks = server_fallbacks
         self.timeout = timeout
         self.max_retries = max_retries
-        self.cache_prompts = cache_prompts
+        self.base_url = base_url
+        self.api_key_env = api_key_env
+        self.compat = compat
+        # Em modo de compatibilidade nada disso existe do outro lado.
+        self.server_fallbacks = server_fallbacks and not compat
+        self.cache_prompts = cache_prompts and not compat
+        self.supports_structured_output = not compat
         self._client = client
         self._sdk: Any = None
+
+    @classmethod
+    def from_preset(cls, preset: str | ProviderPreset, **kwargs: Any) -> "AnthropicProvider":
+        """Cria o provider a partir de um preset (ex.: ``"kimi"``).
+
+        ``model`` e ``base_url`` passados em ``kwargs`` têm precedência sobre
+        os do preset.
+        """
+        cfg = PROVIDER_PRESETS[preset] if isinstance(preset, str) else preset
+        kwargs.setdefault("model", cfg.default_model)
+        kwargs.setdefault("base_url", cfg.base_url)
+        kwargs.setdefault("api_key_env", cfg.api_key_env)
+        kwargs.setdefault("compat", cfg.compat)
+        if not kwargs.get("model"):
+            raise ValueError("preset sem modelo padrão: informe --model")
+        return cls(**kwargs)
 
     # -- SDK
     def _load_sdk(self) -> Any:
@@ -360,9 +444,18 @@ class AnthropicProvider(ModelProvider):
     def _get_client(self) -> Any:
         if self._client is None:
             sdk = self._load_sdk()
+            kwargs: dict[str, Any] = {"timeout": self.timeout, "max_retries": self.max_retries}
+            if self.base_url:
+                kwargs["base_url"] = self.base_url
+            if self.api_key_env != "ANTHROPIC_API_KEY":
+                # Credencial de outro provedor: lida do ambiente, nunca do código.
+                key = os.environ.get(self.api_key_env)
+                if not key:
+                    raise ProviderAuthError(f"variável {self.api_key_env} não definida (exporte a chave do provedor)")
+                kwargs["api_key"] = key
             try:
                 # Sem api_key explícita: o SDK resolve pelo ambiente/perfil.
-                self._client = sdk.AsyncAnthropic(timeout=self.timeout, max_retries=self.max_retries)
+                self._client = sdk.AsyncAnthropic(**kwargs)
             except (TypeError, ValueError, sdk.AnthropicError) as exc:
                 raise ProviderAuthError(f"não foi possível criar o cliente: {exc}", cause=exc) from exc
         return self._client
@@ -402,16 +495,19 @@ class AnthropicProvider(ModelProvider):
             # (preserva blocos de thinking, exigidos ao continuar após tool_use).
             content = m.raw if (m.role == "assistant" and m.raw is not None) else self._to_blocks(m.parts)
             messages.append({"role": m.role, "content": content})
-        output_config: dict[str, Any] = {"effort": request.effort or self.effort}
-        if request.output_schema is not None:
-            output_config["format"] = {"type": "json_schema", "schema": request.output_schema}
         kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": request.max_tokens or self.max_tokens,
             "messages": messages,
-            "thinking": {"type": "adaptive"},
-            "output_config": output_config,
         }
+        if not self.compat:
+            # thinking adaptativo e output_config (effort / saída estruturada)
+            # são específicos da API da Anthropic.
+            output_config: dict[str, Any] = {"effort": request.effort or self.effort}
+            if request.output_schema is not None:
+                output_config["format"] = {"type": "json_schema", "schema": request.output_schema}
+            kwargs["thinking"] = {"type": "adaptive"}
+            kwargs["output_config"] = output_config
         if request.tools:
             kwargs["tools"] = [{"name": t.name, "description": t.description, "input_schema": t.input_schema} for t in request.tools]
         if request.system:
@@ -524,6 +620,15 @@ class AnthropicProvider(ModelProvider):
             raw_content=content,
         )
 
+    def describe(self) -> dict[str, Any]:
+        return {
+            "provider": self.name,
+            "model": self.model,
+            "endpoint": self.base_url or "api.anthropic.com",
+            "compat": self.compat,
+            "usage": self.usage.to_dict(),
+        }
+
     async def aclose(self) -> None:
         client = self._client
         if client is not None and hasattr(client, "close"):
@@ -570,6 +675,7 @@ class FallbackProvider(ModelProvider):
         self.model = providers[0].model
         self.supports_images = all(p.supports_images for p in providers)
         self.supports_tools = all(p.supports_tools for p in providers)
+        self.supports_structured_output = all(getattr(p, "supports_structured_output", True) for p in providers)
 
     @property
     def usage(self) -> UsageTracker:
@@ -667,11 +773,25 @@ def build_provider(config: Any) -> ModelProvider:
     * ``llm_enable_fallbacks`` liga tanto o fallback server-side por recusa
       quanto a cadeia de retries/fallback do lado do cliente.
     """
-    common = dict(max_tokens=config.llm_max_tokens, effort=config.llm_effort, timeout=config.llm_timeout, cache_prompts=config.llm_cache_prompts)
-    primary = AnthropicProvider(model=config.llm_model, server_fallbacks=config.llm_enable_fallbacks, **common)
+    preset = PROVIDER_PRESETS.get(config.llm_provider)
+    if preset is None:
+        raise ValueError(f"provider desconhecido: {config.llm_provider} (opções: {', '.join(sorted(PROVIDER_PRESETS))})")
+    common: dict[str, Any] = dict(
+        max_tokens=config.llm_max_tokens,
+        effort=config.llm_effort,
+        timeout=config.llm_timeout,
+        cache_prompts=config.llm_cache_prompts,
+        base_url=config.llm_base_url or preset.base_url,
+        api_key_env=config.llm_api_key_env or preset.api_key_env,
+        compat=preset.compat,
+    )
+    model = config.llm_model or preset.default_model
+    if not model:
+        raise ValueError(f"o provider '{config.llm_provider}' não tem modelo padrão: informe --model")
+    primary = AnthropicProvider(model=model, server_fallbacks=config.llm_enable_fallbacks, **common)
     if not config.llm_enable_fallbacks:
         return primary
     chain: list[ModelProvider] = [primary]
-    for model in config.llm_fallback_models:
-        chain.append(AnthropicProvider(model=model, server_fallbacks=True, **common))
+    for fallback_model in config.llm_fallback_models:
+        chain.append(AnthropicProvider(model=fallback_model, server_fallbacks=not preset.compat, **common))
     return FallbackProvider(chain, max_retries=config.llm_max_retries)
