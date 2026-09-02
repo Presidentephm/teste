@@ -32,7 +32,12 @@ def build_strategy(name: str, config: AgentConfig, provider: ModelProvider | Non
         return HeuristicFixStrategy()
     if name == "claude":
         return ClaudeFixStrategy(config, provider=provider)
-    return AutoStrategy(provider if provider is not None else build_provider(config))
+    return AutoStrategy(
+        provider if provider is not None else build_provider(config),
+        use_tools=config.llm_use_tools,
+        max_tool_rounds=config.llm_max_tool_rounds,
+        effort_by_error=config.effort_by_error,
+    )
 
 
 def _add_vision_args(p: argparse.ArgumentParser) -> None:
@@ -57,6 +62,9 @@ def _add_model_args(p: argparse.ArgumentParser) -> None:
     g.add_argument("--no-fallback", "--no-fallbacks", dest="fallback", action="store_false", help="desativa retries e fallback")
     g.add_argument("--fallback-model", action="append", default=[], help="modelo alternativo (repetível)")
     g.add_argument("--llm-timeout", type=float, default=600.0)
+    g.add_argument("--no-tools", dest="use_tools", action="store_false", default=True, help="modelo recebe o esqueleto no prompt em vez de ler arquivos via ferramentas")
+    g.add_argument("--max-tool-rounds", type=int, default=8)
+    g.add_argument("--no-cache", dest="cache_prompts", action="store_false", default=True, help="desativa cache_control no prefixo do prompt")
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -74,6 +82,7 @@ def make_parser() -> argparse.ArgumentParser:
     run.add_argument("--timeout", type=float, default=30.0, help="timeout (s) de cada execução no sandbox")
     run.add_argument("--total-timeout", type=float, default=None, help="tempo máximo (s) do ciclo inteiro")
     run.add_argument("--tests", default=None, help='comando de testes após "python", ex.: "-m unittest discover -s tests"')
+    run.add_argument("--tests-in-place", action="store_true", help="roda os testes na raiz real em vez da cópia isolada")
     run.add_argument("--memory-limit", type=int, default=100)
     run.add_argument("--reset-memory", action="store_true", help="apaga a memória persistida antes de começar")
     run.add_argument("--no-self-modify", action="store_true", help="proíbe alterar o pacote agent_core")
@@ -104,6 +113,14 @@ def make_parser() -> argparse.ArgumentParser:
 
     mem = sub.add_parser("memory", help="mostra ou limpa a memória persistida")
     mem.add_argument("--clear", action="store_true")
+
+    bench = sub.add_parser("bench", help="benchmark: taxa de correção, iterações, tokens e custo")
+    bench.add_argument("--strategy", choices=["auto", "heuristic"], default="auto")
+    bench.add_argument("--offline", action="store_true", help="usa FakeProvider com as respostas canônicas (sem custo)")
+    bench.add_argument("--cases", default=None, help="lista separada por vírgula (padrão: todos)")
+    bench.add_argument("--max-iterations", type=int, default=5)
+    bench.add_argument("--json", action="store_true")
+    _add_model_args(bench)
     return p
 
 
@@ -117,6 +134,9 @@ def config_from_args(ns: argparse.Namespace) -> AgentConfig:
             llm_enable_fallbacks=ns.fallback,
             llm_fallback_models=tuple(ns.fallback_model),
             llm_timeout=ns.llm_timeout,
+            llm_use_tools=ns.use_tools,
+            llm_max_tool_rounds=ns.max_tool_rounds,
+            llm_cache_prompts=ns.cache_prompts,
         )
     if hasattr(ns, "vision"):
         kwargs.update(
@@ -136,6 +156,7 @@ def config_from_args(ns: argparse.Namespace) -> AgentConfig:
             sandbox_timeout=ns.timeout,
             total_timeout=ns.total_timeout,
             test_command=tuple(shlex.split(ns.tests)) if ns.tests else None,
+            tests_isolated=not ns.tests_in_place,
             memory_limit=ns.memory_limit,
             allow_self_modification=not ns.no_self_modify,
         )
@@ -191,6 +212,32 @@ async def _cmd_ask(ns: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_bench(ns: argparse.Namespace) -> int:
+    from . import bench as B
+
+    config = config_from_args(ns)
+    names = [c.strip() for c in ns.cases.split(",")] if ns.cases else None
+    overrides = {"max_iterations": ns.max_iterations, "llm_use_tools": config.llm_use_tools, "llm_max_tool_rounds": config.llm_max_tool_rounds, "effort_by_error": config.effort_by_error}
+    provider: ModelProvider | None = None
+    if ns.strategy == "heuristic":
+        cases = B.select_cases(names, heuristic_only=True)
+        factory, model = B.heuristic_factory, "-"
+    elif ns.offline:
+        cases = B.select_cases(names)
+        factory, model = B.offline_factory, "fake"
+    else:
+        cases = B.select_cases(names)
+        provider = build_provider(config)
+        factory, model = B.provider_factory(provider), config.llm_model
+    try:
+        report = await B.run_benchmark(cases, factory, strategy_name=ns.strategy, model=model, config_overrides=overrides)
+    finally:
+        if provider is not None:
+            await provider.aclose()
+    print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False) if ns.json else report.table())
+    return 0 if report.fix_rate == 1.0 else 1
+
+
 async def _cmd_memory(ns: argparse.Namespace) -> int:
     config = AgentConfig(project_root=Path(ns.root), log_level=ns.log_level)
     memory = AgentMemory(config.memory_limit, config.memory_path)
@@ -212,6 +259,8 @@ async def _main(argv: list[str]) -> int:
         return await _cmd_ask(ns)
     if ns.command == "memory":
         return await _cmd_memory(ns)
+    if ns.command == "bench":
+        return await _cmd_bench(ns)
 
     config = AgentConfig(project_root=Path(ns.root), log_level=ns.log_level)
     code = CodeManager(config)
@@ -240,6 +289,7 @@ def report_to_dict(report) -> dict:
         "touched_files": report.touched_files,
         "vision": report.vision_status,
         "context": report.context_summary,
+        "usage": report.usage,
         "iterations": [
             {
                 "attempt": it.attempt,

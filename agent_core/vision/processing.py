@@ -115,6 +115,13 @@ class OCREngine:
         except ImportError:
             pass
 
+    @classmethod
+    def disabled(cls) -> "OCREngine":
+        """Instância que nunca reconhece texto (OCR desligado por configuração)."""
+        engine = cls.__new__(cls)
+        engine.lang, engine._pt, engine.available = "eng", None, False
+        return engine
+
     def read(self, frame: Frame) -> str | None:
         if not self.available or self._pt is None:
             return None

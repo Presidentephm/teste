@@ -76,7 +76,7 @@ pip install -r requirements.txt
 | `anthropic>=1.3` | `AnthropicProvider` (SDK oficial). Testado com 1.3.0. | Só para usar o modelo |
 | `opencv-python-headless`, `numpy` | Subsistema de visão | Só com `--vision` |
 | `mss` | `ScreenSource` (captura de tela) | Opcional |
-| `pytesseract` + binário `tesseract` | OCR real no pipeline visual | Opcional; sem eles `text=None`, `ocr="unavailable"` |
+| `pytesseract` + binário `tesseract` (`apt install tesseract-ocr`) | OCR real no pipeline visual; a estratégia lê mensagens de erro na tela | Opcional; sem eles `text=None`, `ocr="unavailable"`; `vision_ocr=False` desliga |
 
 O núcleo (backup, AST, sandbox, heurística, memória, contexto) usa só a biblioteca padrão.
 
@@ -91,6 +91,10 @@ O núcleo (backup, AST, sandbox, heurística, memória, contexto) usa só a bibl
   - client-side: `FallbackProvider` faz retry com backoff em rate limit/timeout/5xx e passa a `--fallback-model` alternativos.
 - Erros tratados e normalizados: autenticação, pedido inválido/modelo inexistente, rate limit (`retry-after`), timeout, indisponibilidade/conexão, recusa, resposta vazia/inválida, interrupção (cancelamento).
 - Logs, memória e prompts passam por `redact()` (chaves `sk-ant-…`, tokens Bearer, `api_key=`…).
+- **Ferramentas** (`--no-tools` desliga): por padrão o modelo recebe um prompt compacto e ferramentas de leitura (`read_file`, `list_files`, `search`, `outline`) e entrega a correção via `propose_patch`, num loop manual de `tool_use` limitado por `--max-tool-rounds`. Sem ferramentas, o esqueleto do projeto vai no prompt e a resposta usa saída estruturada (`output_config.format` com o JSON Schema do patch).
+- **Esforço por tipo de erro** (`AgentConfig.effort_by_error`): `NameError`/`ImportError`/indentação → `low`; `SyntaxError`/`TypeError`/`AttributeError`/`KeyError` → `medium`; timeout, testes e o restante → `high`. Cada pedido ao modelo leva o esforço da falha atual.
+- **Cache de prompt** (`--no-cache` desliga): o prefixo estável (ferramentas + sistema) recebe `cache_control`; o conteúdo variável fica depois do breakpoint.
+- **Uso e custo**: cada provider acumula chamadas, tokens (entrada, saída, cache) e custo estimado pela tabela de preços por modelo; o relatório do `run` e o `bench` mostram o delta.
 
 ## Visão
 
@@ -131,12 +135,23 @@ python -m agent_core run app.py --strategy auto --vision --vision-source image \
 | `--fallback` / `--no-fallback`, `--fallback-model M` | ligado | Retry + fallback server/client-side. |
 | `--vision` / `--no-vision`, `--vision-source`, `--camera-index`, `--monitor`, `--image`, `--fps`, `--observation-interval`, `--store-frames` | desligado | Observação visual. |
 | `--max-iterations`, `--max-retries`, `--timeout`, `--total-timeout` | 5, 3, 30 s, ∞ | Limites do ciclo. |
-| `--tests "…"` | — | Comando de testes (após `python`) que também precisa passar. |
+| `--tests "…"`, `--tests-in-place` | — | Comando de testes (após `python`) que também precisa passar; por padrão roda na cópia isolada do projeto. |
+| `--no-tools`, `--max-tool-rounds`, `--no-cache` | ferramentas ligadas, 8, cache ligado | Modo de consulta ao modelo. |
 | `--memory-limit`, `--reset-memory` | 100 | Memória do agente. |
 | `--no-self-modify` | — | Proíbe alterar `agent_core/`. |
 | `--json` | — | Relatório em JSON. |
 
-Outros comandos: `analyze <arquivo>`, `backups [arquivo]`, `rollback <arquivo>`, `observe`, `ask "<prompt>" [--image f] [--fake]`, `memory [--clear]`.
+Outros comandos: `analyze <arquivo>`, `backups [arquivo]`, `rollback <arquivo>`, `observe`, `ask "<prompt>" [--image f] [--fake]`, `memory [--clear]`, `bench`.
+
+## Benchmark
+
+```bash
+python -m agent_core bench --offline                 # FakeProvider com respostas canônicas (sem custo)
+python -m agent_core bench --strategy heuristic      # só os casos que a heurística resolve
+ANTHROPIC_API_KEY=... python -m agent_core bench --model claude-opus-5 --effort medium --json
+```
+
+Sete casos (`agent_core/bench.py`): import da stdlib, símbolo de módulo irmão, typo, tabs, divisão por zero, `TypeError` e teste falhando. O relatório traz status, iterações, tempo, tokens, custo total e custo por correção. Para medir o modelo real, rode com credenciais e compare `--effort` e `--no-tools`; o `bench` compartilha um único provider entre os casos, então o uso acumula.
 
 ## Uso programático
 
@@ -160,6 +175,7 @@ Extensão: `AutoStrategy(provider, analyzers=[...], planners=[...])` aceita qual
 - Nenhuma escrita sem backup/checkpoint; escrita atômica; código que não compila nunca chega ao disco.
 - Confinamento à raiz do projeto; `.git/` e `.agent_backups/` são intocáveis; auto-modificação pode ser desligada.
 - `PatchGuard`: no máximo N arquivos por decisão, sem esvaziar arquivos, sem remover mais de 60 % das linhas.
+- Ferramentas do modelo são somente leitura e confinadas à raiz; a escrita continua passando por checkpoint, guarda e validação.
 - Rollback automático em regressão crítica, patch inócuo ou testes que regrediram; ação `rollback` explícita; `rollback_run(report)`; CLI `rollback` caminha no histórico.
 - Loop infinito: iterações, retries, timeout total, estagnação, recusa de patch repetido.
 - O agente atua apenas dentro do workspace; não contorna permissões do sistema, autenticação ou controles externos.
@@ -170,7 +186,7 @@ Extensão: `AutoStrategy(provider, analyzers=[...], planners=[...])` aceita qual
 python -m unittest discover -s tests -v
 ```
 
-Suítes: `test_agent_core.py` (23 originais), `test_providers.py`, `test_vision.py`, `test_multimodal.py`, `test_auto_strategy.py`, `test_loop_v2.py`, `test_memory_safety.py`. Todas determinísticas (fakes/mocks); chamadas reais ao modelo ficam fora da suíte (`examples/provider_call.py`, `ask`).
+Suítes: `test_agent_core.py` (23 originais), `test_providers.py`, `test_vision.py`, `test_multimodal.py`, `test_auto_strategy.py`, `test_loop_v2.py`, `test_memory_safety.py`, `test_tools_and_bench.py`. Todas determinísticas (fakes/mocks); chamadas reais ao modelo ficam fora da suíte (`examples/provider_call.py`, `ask`, `bench` sem `--offline`). O workflow `.github/workflows/tests.yml` roda a suíte e o benchmark offline em Python 3.10–3.12.
 
 ## Exemplos (`examples/`)
 
@@ -183,11 +199,13 @@ Suítes: `test_agent_core.py` (23 originais), `test_providers.py`, `test_vision.
 | `agent_loop_demo.py` | AgentLoop programático offline. |
 | `auto_strategy_demo.py` | Strategy Auto corrigindo um `ZeroDivisionError` (fake ou `--real`). |
 | `run_with_vision.py` | Ciclo completo com observações visuais. |
+| `tool_strategy_demo.py` | Modelo lendo o projeto por ferramentas (`search` → `read_file` → `propose_patch`). |
 
 ## Limitações
 
 - O sandbox isola efeitos colaterais e travamentos; não é barreira contra código hostil (use contêiner).
 - OCR só existe com Tesseract instalado; sem ele a análise visual é estatística/estrutural.
 - Captura de tela exige display (`mss`); em servidores headless a fonte falha de forma limpa.
-- A heurística cobre imports e indentação; o restante depende do modelo.
-- `--tests` roda na raiz real do projeto (não na cópia isolada).
+- A heurística cobre imports ausentes, typos de nome e indentação; o restante depende do modelo.
+- O custo é estimado por uma tabela de preços embutida (`MODEL_PRICES`); modelos fora dela aparecem como não precificados.
+- A validação com o modelo real depende de credenciais no ambiente; o harness (`bench`) está pronto, mas os números reais precisam ser medidos pelo usuário.

@@ -24,7 +24,7 @@ from typing import Any, Awaitable, Callable
 
 from ..observations import Observation, ObservationKind, Observer
 from .frames import Frame, VisionUnavailableError, is_available, require_cv2
-from .processing import VisualPipeline
+from .processing import OCREngine, VisualAnalyzer, VisualPipeline
 from .sources import VisualSource, open_source
 
 logger = logging.getLogger("agent_core.vision")
@@ -58,6 +58,7 @@ class VisionCapture:
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._lock = asyncio.Lock()
+        self._first_ready = asyncio.Event()
         self.error: str | None = None
         self.frames_read = 0
         self.frames_failed = 0
@@ -72,6 +73,15 @@ class VisionCapture:
 
     def latest(self) -> Observation | None:
         return self._history[-1] if self._history else None
+
+    async def wait_latest(self, timeout: float = 3.0) -> Observation | None:
+        """Última observação; se ainda não houver, espera a primeira até ``timeout``."""
+        if not self._history and self.is_running:
+            try:
+                await asyncio.wait_for(self._first_ready.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                return None
+        return self.latest()
 
     def history(self) -> list[Observation]:
         return list(self._history)
@@ -109,6 +119,7 @@ class VisionCapture:
             return False
         self.error = None
         self._stop = asyncio.Event()
+        self._first_ready = asyncio.Event()
         self.pipeline.reset()
         self._task = asyncio.create_task(self._run(), name="vision-capture")
         return True
@@ -149,6 +160,7 @@ class VisionCapture:
             self._history.append(observation)
             self.observations_emitted += 1
             self._last_emit = time.monotonic()
+            self._first_ready.set()
             if frame is not None and self.store_dir and observation.metadata.get("changed") and self.stored < self.max_stored:
                 path = await asyncio.to_thread(self._store, frame)
                 if path:
@@ -222,16 +234,17 @@ class VisionObserver(Observer):
     name = "vision"
     kind = ObservationKind.VISION
 
-    def __init__(self, capture: VisionCapture, *, fresh: bool = True) -> None:
+    def __init__(self, capture: VisionCapture, *, fresh: bool = True, wait_timeout: float = 3.0) -> None:
         self.capture = capture
         self.fresh = fresh
+        self.wait_timeout = wait_timeout
 
     async def observe(self, **_: Any) -> list[Observation]:
         try:
             if self.fresh or not self.capture.is_running:
                 obs = await self.capture.snapshot()
             else:
-                obs = self.capture.latest()
+                obs = await self.capture.wait_latest(self.wait_timeout)
         except Exception as exc:  # jamais derruba o loop
             logger.warning("observação visual falhou: %s", exc)
             return []
@@ -249,9 +262,10 @@ def build_vision_capture(config: Any, *, on_observation: ObservationHook | None 
         images=list(config.vision_images),
     )
     store = (config.backup_dir / "frames") if config.vision_store_frames else None
+    ocr = OCREngine() if getattr(config, "vision_ocr", True) else OCREngine.disabled()
     return VisionCapture(
         source,
-        VisualPipeline(),
+        VisualPipeline(analyzer=VisualAnalyzer(ocr=ocr)),
         fps=config.vision_fps,
         observation_interval=config.observation_interval,
         store_dir=store,

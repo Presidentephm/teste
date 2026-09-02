@@ -7,3 +7,4 @@ numpy>=1.26
 # Captura de tela (ScreenSource). Opcional.
 mss>=9.0
 # OCR opcional: pip install pytesseract e instale o binário `tesseract` no sistema.
+# pytesseract>=0.3   # descomente para OCR (requer o binário tesseract)

@@ -24,6 +24,7 @@ observação visual; o ciclo continua com as demais evidências.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import time
 from dataclasses import dataclass, field
@@ -86,6 +87,7 @@ class AgentRunReport:
     duration: float = 0.0
     vision_status: dict[str, Any] | None = None
     context_summary: str = ""
+    usage: dict[str, Any] | None = None  # tokens/custo do provider durante o run
 
     @property
     def all_backups(self) -> list[BackupRecord]:
@@ -112,6 +114,10 @@ class AgentRunReport:
             lines.append(f"  visão: {self.vision_status}")
         if self.context_summary:
             lines.append(f"  contexto: {self.context_summary}")
+        if self.usage and self.usage.get("calls"):
+            u = self.usage
+            cost = f" custo≈US${u['cost_usd']:.4f}" if u.get("priced") else ""
+            lines.append(f"  modelo: {u['calls']} chamadas, {u['input_tokens']} in / {u['output_tokens']} out tokens, cache {u['cache_read_tokens']} lidos{cost}")
         return redact("\n".join(lines))
 
 
@@ -258,6 +264,8 @@ class SelfImprovementAgent:
             memory=self.memory,
             tests=snap.tests,
             vision_available=self.vision_available,
+            code_manager=self.code,
+            effort=self.config.effort_for(snap.signature),
         )
 
     # ------------------------------------------------------------------ loop
@@ -268,6 +276,7 @@ class SelfImprovementAgent:
         report = AgentRunReport(script=script_rel, status="aborted")
         self.context = MultimodalContext()
         self._surviving = []
+        usage_before = self._usage_snapshot()
         if self.vision is not None:
             ok = await self.vision.start()
             if not ok:
@@ -280,11 +289,32 @@ class SelfImprovementAgent:
         finally:
             report.duration = time.perf_counter() - started
             report.context_summary = self.context.summary()
+            report.usage = self._usage_delta(usage_before)
             if self.vision is not None:
                 report.vision_status = self.vision.status()
                 await self.vision.stop()
             await self._emit("run.end", status=report.status, iterations=len(report.iterations))
         return report
+
+    @property
+    def provider(self) -> ModelProvider | None:
+        """Provider usado pela estratégia, se ela expuser um."""
+        return getattr(self.strategy, "provider", None)
+
+    def _usage_snapshot(self):
+        provider = self.provider
+        return copy.copy(provider.usage) if provider is not None else None
+
+    def _usage_delta(self, before) -> dict[str, Any] | None:
+        provider = self.provider
+        if provider is None or before is None:
+            return None
+        after = provider.usage
+        delta = {k: getattr(after, k) - getattr(before, k) for k in ("calls", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "latency_total", "cost_usd")}
+        delta["cost_usd"] = round(delta["cost_usd"], 6)
+        delta["latency_total"] = round(delta["latency_total"], 3)
+        delta["priced"] = after.priced
+        return delta
 
     def _out_of_time(self, started: float) -> bool:
         return self.config.total_timeout is not None and (time.perf_counter() - started) > self.config.total_timeout

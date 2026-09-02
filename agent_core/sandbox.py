@@ -238,14 +238,30 @@ class Sandbox:
         timeout: float | None = None,
         stdin: str | None = None,
         path_map: dict[str, str] | None = None,
+        isolated: bool = False,
     ) -> ExecutionResult:
         """Executa um comando arbitrário com captura completa e timeout.
+
+        Com ``isolated=True`` o projeto é copiado para um diretório temporário
+        e o comando roda lá (``cwd`` relativo é reinterpretado na cópia); os
+        caminhos do traceback voltam mapeados para o projeto real.
 
         Nunca levanta exceção por falha do comando: tudo vai para o
         ``ExecutionResult``. Só levanta se o próprio interpretador/executável
         não puder ser iniciado (``FileNotFoundError``), pois isso é erro de
         configuração do agente, não do código em teste.
         """
+        if isolated:
+            tmp_dir = Path(tempfile.mkdtemp(prefix="agent_sandbox_"))
+            try:
+                await asyncio.to_thread(self._copy_project, tmp_dir)
+                rel_cwd = Path(cwd).resolve().relative_to(self.root) if cwd else Path(".")
+                return await self.run_command(
+                    command, cwd=tmp_dir / rel_cwd, timeout=timeout, stdin=stdin,
+                    path_map={str(tmp_dir): str(self.root), **(path_map or {})},
+                )
+            finally:
+                await asyncio.to_thread(shutil.rmtree, tmp_dir, True)
         timeout = timeout or self.config.sandbox_timeout
         cmd = [str(c) for c in command]
         started = time.perf_counter()
@@ -329,20 +345,14 @@ class Sandbox:
             cmd = [self.config.python_executable, "-E", "-s", "-X", "faulthandler", str(script_path), *args]
             return await self.run_command(cmd, cwd=self.root, timeout=timeout)
 
-        tmp_dir = Path(tempfile.mkdtemp(prefix="agent_sandbox_"))
-        try:
-            await asyncio.to_thread(self._copy_project, tmp_dir)
-            target = tmp_dir / rel
-            cmd = [self.config.python_executable, "-E", "-s", "-X", "faulthandler", str(target), *args]
-            path_map = {str(tmp_dir): str(self.root)}
-            return await self.run_command(cmd, cwd=tmp_dir, timeout=timeout, path_map=path_map)
-        finally:
-            await asyncio.to_thread(shutil.rmtree, tmp_dir, True)
+        # Caminho relativo: dentro da cópia o script fica no mesmo lugar relativo.
+        cmd = [self.config.python_executable, "-E", "-s", "-X", "faulthandler", str(rel), *args]
+        return await self.run_command(cmd, cwd=self.root, timeout=timeout, isolated=True)
 
-    async def run_tests(self, pattern: str = "test*.py", timeout: float | None = None) -> ExecutionResult:
+    async def run_tests(self, pattern: str = "test*.py", timeout: float | None = None, *, isolated: bool = True) -> ExecutionResult:
         """Roda a suíte ``unittest`` do projeto no sandbox (útil como critério de sucesso)."""
         cmd = [self.config.python_executable, "-E", "-s", "-m", "unittest", "discover", "-p", pattern]
-        return await self.run_command(cmd, cwd=self.root, timeout=timeout or self.config.sandbox_timeout * 4)
+        return await self.run_command(cmd, cwd=self.root, timeout=timeout or self.config.sandbox_timeout * 4, isolated=isolated)
 
     async def check_syntax(self, path: str | Path) -> ExecutionResult:
         """Compila um arquivo com ``py_compile`` sem executá-lo."""

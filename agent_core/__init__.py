@@ -52,8 +52,12 @@ from .providers import (
     ProviderRefusalError,
     ProviderRequestError,
     ProviderInterrupted,
+    ToolSpec,
+    ToolCall,
+    UsageTracker,
     build_provider,
 )
+from .tools import ProjectToolbox, PATCH_SCHEMA
 from .observations import (
     Observation,
     ObservationKind,
@@ -75,6 +79,7 @@ from .strategies import (
     ActionKind,
     HeuristicFixStrategy,
     ModelFixStrategy,
+    ToolFixStrategy,
     ClaudeFixStrategy,
     CompositeFixStrategy,
     AutoStrategy,
@@ -92,7 +97,8 @@ __all__ = [
     "ModelProvider", "AnthropicProvider", "FallbackProvider", "FakeProvider", "ModelRequest", "ModelResponse",
     "ModelMessage", "ContentPart", "ProviderError", "ProviderAuthError", "ProviderRateLimitError",
     "ProviderTimeoutError", "ProviderUnavailableError", "ProviderInvalidResponseError", "ProviderRefusalError",
-    "ProviderRequestError", "ProviderInterrupted", "build_provider",
+    "ProviderRequestError", "ProviderInterrupted", "ToolSpec", "ToolCall", "UsageTracker", "build_provider",
+    "ProjectToolbox", "PATCH_SCHEMA", "ToolFixStrategy",
     "Observation", "ObservationKind", "ImageData", "MultimodalContext", "ContextLimits", "Observer",
     "RuntimeObserver", "TestObserver", "LogObserver", "CodeObserver",
     "AgentMemory", "MemoryEntry", "patch_signature",
@@ -101,4 +107,4 @@ __all__ = [
     "SelfImprovementAgent", "AgentRunReport", "IterationRecord",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

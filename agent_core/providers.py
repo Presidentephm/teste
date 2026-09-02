@@ -5,13 +5,18 @@ Camada de provider de modelo (desacoplada do SDK).
 
 Somente este módulo importa ``anthropic``. O restante do sistema fala com
 ``ModelProvider`` usando tipos próprios (``ModelRequest``/``ModelResponse``,
-``ContentPart``) e recebe erros normalizados (``ProviderError`` e subclasses),
-o que permite trocar o SDK, injetar um ``FakeProvider`` em testes ou encadear
-providers com ``FallbackProvider`` sem tocar nas estratégias.
+``ContentPart``, ``ToolSpec``/``ToolCall``) e recebe erros normalizados
+(``ProviderError`` e subclasses), o que permite trocar o SDK, injetar um
+``FakeProvider`` em testes ou encadear providers com ``FallbackProvider`` sem
+tocar nas estratégias.
 
 Compatibilidade verificada com ``anthropic`` 1.3.0:
     * ``AsyncAnthropic().messages.stream(...)`` + ``get_final_message()``;
     * ``thinking={"type": "adaptive"}`` e ``output_config={"effort": ...}``;
+    * ferramentas (``tools=[{name, description, input_schema}]``) com loop
+      manual: blocos ``tool_use`` na resposta e ``tool_result`` na volta;
+    * saída estruturada ``output_config={"format": {"type": "json_schema", ...}}``;
+    * cache de prompt: ``cache_control`` no bloco de sistema;
     * fallback server-side por recusa via ``client.beta.messages.stream(
       betas=["server-side-fallback-2026-07-01"], fallbacks="default")``;
     * blocos de imagem ``{"type": "image", "source": {"type": "base64", ...}}``.
@@ -41,17 +46,38 @@ from .safety import redact
 logger = logging.getLogger("agent_core.providers")
 
 # ------------------------------------------------------------------ mensagens
-PartType = Literal["text", "image"]
+PartType = Literal["text", "image", "tool_use", "tool_result"]
+
+
+@dataclass
+class ToolSpec:
+    """Definição de uma ferramenta que o modelo pode chamar."""
+
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+
+@dataclass
+class ToolCall:
+    """Pedido do modelo para executar uma ferramenta."""
+
+    id: str
+    name: str
+    input: dict[str, Any]
 
 
 @dataclass
 class ContentPart:
-    """Parte de uma mensagem: texto ou imagem (bytes + media type)."""
+    """Parte de uma mensagem: texto, imagem, chamada ou resultado de ferramenta."""
 
     type: PartType
     text: str = ""
     data: bytes = b""
     media_type: str = "image/jpeg"
+    tool_call: ToolCall | None = None
+    tool_use_id: str = ""
+    is_error: bool = False
 
     @classmethod
     def from_text(cls, text: str) -> "ContentPart":
@@ -61,15 +87,32 @@ class ContentPart:
     def from_image(cls, data: bytes, media_type: str = "image/jpeg") -> "ContentPart":
         return cls(type="image", data=data, media_type=media_type)
 
+    @classmethod
+    def from_tool_use(cls, call: ToolCall) -> "ContentPart":
+        return cls(type="tool_use", tool_call=call)
+
+    @classmethod
+    def from_tool_result(cls, tool_use_id: str, content: str, *, is_error: bool = False) -> "ContentPart":
+        return cls(type="tool_result", text=content, tool_use_id=tool_use_id, is_error=is_error)
+
 
 @dataclass
 class ModelMessage:
     role: Literal["user", "assistant"]
     parts: list[ContentPart]
+    raw: Any = None  # payload opaco do provider para reenviar um turno do assistente sem perdas
 
     @classmethod
     def user(cls, *parts: ContentPart | str) -> "ModelMessage":
         return cls("user", [ContentPart.from_text(p) if isinstance(p, str) else p for p in parts])
+
+    @classmethod
+    def assistant_from(cls, response: "ModelResponse") -> "ModelMessage":
+        return cls("assistant", list(response.parts), raw=response.raw_content)
+
+    @classmethod
+    def tool_results(cls, results: Sequence[ContentPart]) -> "ModelMessage":
+        return cls("user", list(results))
 
 
 @dataclass
@@ -78,6 +121,8 @@ class ModelRequest:
     system: str = ""
     max_tokens: int | None = None
     effort: str | None = None
+    tools: list[ToolSpec] = field(default_factory=list)
+    output_schema: dict[str, Any] | None = None  # saída estruturada (JSON Schema)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -94,7 +139,88 @@ class ModelResponse:
     truncated: bool = False
     fallback_used: bool = False
     latency: float = 0.0
+    parts: list[ContentPart] = field(default_factory=list)
     raw: Any = None
+    raw_content: Any = None
+
+    @property
+    def tool_calls(self) -> list[ToolCall]:
+        return [p.tool_call for p in self.parts if p.type == "tool_use" and p.tool_call is not None]
+
+    @property
+    def wants_tools(self) -> bool:
+        return bool(self.tool_calls)
+
+
+# --------------------------------------------------------------------- custo
+# USD por milhão de tokens (entrada, saída). Cache: leitura 10 %, escrita 125 % da entrada.
+MODEL_PRICES: dict[str, tuple[float, float]] = {
+    "claude-fable-5-1": (10.0, 50.0),
+    "claude-fable-5": (10.0, 50.0),
+    "claude-opus-5": (5.0, 25.0),
+    "claude-opus-4-8": (5.0, 25.0),
+    "claude-opus-4-7": (5.0, 25.0),
+    "claude-opus-4-6": (5.0, 25.0),
+    "claude-sonnet-5": (2.0, 10.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+}
+
+
+def price_for(model: str) -> tuple[float, float] | None:
+    for key, price in MODEL_PRICES.items():
+        if model.startswith(key):
+            return price
+    return None
+
+
+@dataclass
+class UsageTracker:
+    """Acumula tokens, latência e custo estimado de todas as chamadas."""
+
+    calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    latency_total: float = 0.0
+    cost_usd: float = 0.0
+    priced: bool = True  # False se algum modelo não tinha preço conhecido
+
+    def record(self, model: str, usage: dict[str, int], latency: float = 0.0) -> None:
+        self.calls += 1
+        i = usage.get("input_tokens", 0)
+        o = usage.get("output_tokens", 0)
+        cr = usage.get("cache_read_input_tokens", 0)
+        cw = usage.get("cache_creation_input_tokens", 0)
+        self.input_tokens += i
+        self.output_tokens += o
+        self.cache_read_tokens += cr
+        self.cache_write_tokens += cw
+        self.latency_total += latency
+        price = price_for(model)
+        if price is None:
+            self.priced = False
+            return
+        pin, pout = price
+        self.cost_usd += (i * pin + o * pout + cr * pin * 0.1 + cw * pin * 1.25) / 1_000_000
+
+    def merge(self, other: "UsageTracker") -> "UsageTracker":
+        out = UsageTracker(**{k: getattr(self, k) + getattr(other, k) for k in ("calls", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "latency_total", "cost_usd")})
+        out.priced = self.priced and other.priced
+        return out
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "calls": self.calls,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "latency_total": round(self.latency_total, 3),
+            "cost_usd": round(self.cost_usd, 6),
+            "priced": self.priced,
+        }
 
 
 # --------------------------------------------------------------------- erros
@@ -163,6 +289,14 @@ class ModelProvider(ABC):
     name: str = "base"
     model: str = ""
     supports_images: bool = True
+    supports_tools: bool = True
+
+    def __init__(self) -> None:
+        self._usage = UsageTracker()
+
+    @property
+    def usage(self) -> UsageTracker:
+        return self._usage
 
     @abstractmethod
     async def complete(self, request: ModelRequest) -> ModelResponse:
@@ -172,7 +306,7 @@ class ModelProvider(ABC):
         """Libera recursos (conexões HTTP)."""
 
     def describe(self) -> dict[str, Any]:
-        return {"provider": self.name, "model": self.model}
+        return {"provider": self.name, "model": self.model, "usage": self.usage.to_dict()}
 
 
 # ----------------------------------------------------------------- Anthropic
@@ -191,14 +325,17 @@ class AnthropicProvider(ModelProvider):
         server_fallbacks: bool = True,
         timeout: float = 600.0,
         max_retries: int = 2,
+        cache_prompts: bool = True,
         client: Any | None = None,
     ) -> None:
+        super().__init__()
         self.model = model
         self.max_tokens = max_tokens
         self.effort = effort
         self.server_fallbacks = server_fallbacks
         self.timeout = timeout
         self.max_retries = max_retries
+        self.cache_prompts = cache_prompts
         self._client = client
         self._sdk: Any = None
 
@@ -249,18 +386,41 @@ class AnthropicProvider(ModelProvider):
                         },
                     }
                 )
+            elif part.type == "tool_use" and part.tool_call is not None:
+                blocks.append({"type": "tool_use", "id": part.tool_call.id, "name": part.tool_call.name, "input": part.tool_call.input})
+            elif part.type == "tool_result":
+                block: dict[str, Any] = {"type": "tool_result", "tool_use_id": part.tool_use_id, "content": part.text}
+                if part.is_error:
+                    block["is_error"] = True
+                blocks.append(block)
         return blocks or [{"type": "text", "text": "(vazio)"}]
 
     def _build_kwargs(self, request: ModelRequest) -> dict[str, Any]:
+        messages = []
+        for m in request.messages:
+            # Um turno do assistente reenviado usa o conteúdo original do SDK
+            # (preserva blocos de thinking, exigidos ao continuar após tool_use).
+            content = m.raw if (m.role == "assistant" and m.raw is not None) else self._to_blocks(m.parts)
+            messages.append({"role": m.role, "content": content})
+        output_config: dict[str, Any] = {"effort": request.effort or self.effort}
+        if request.output_schema is not None:
+            output_config["format"] = {"type": "json_schema", "schema": request.output_schema}
         kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": request.max_tokens or self.max_tokens,
-            "messages": [{"role": m.role, "content": self._to_blocks(m.parts)} for m in request.messages],
+            "messages": messages,
             "thinking": {"type": "adaptive"},
-            "output_config": {"effort": request.effort or self.effort},
+            "output_config": output_config,
         }
+        if request.tools:
+            kwargs["tools"] = [{"name": t.name, "description": t.description, "input_schema": t.input_schema} for t in request.tools]
         if request.system:
-            kwargs["system"] = request.system
+            if self.cache_prompts:
+                # Prefixo estável (tools + system) marcado para cache; o conteúdo
+                # variável (traceback, fonte) fica depois do breakpoint.
+                kwargs["system"] = [{"type": "text", "text": request.system, "cache_control": {"type": "ephemeral"}}]
+            else:
+                kwargs["system"] = request.system
         return kwargs
 
     def _map_exception(self, exc: BaseException) -> ProviderError:
@@ -330,25 +490,38 @@ class AnthropicProvider(ModelProvider):
             category = getattr(details, "category", None) if details else None
             raise ProviderRefusalError(f"o modelo recusou o pedido (categoria={category})")
         content = getattr(message, "content", None) or []
-        text = "".join(getattr(b, "text", "") for b in content if getattr(b, "type", "") == "text")
-        if not text.strip():
+        parts: list[ContentPart] = []
+        for block in content:
+            btype = getattr(block, "type", "")
+            if btype == "text":
+                parts.append(ContentPart.from_text(getattr(block, "text", "")))
+            elif btype == "tool_use":
+                raw_input = getattr(block, "input", {}) or {}
+                parts.append(ContentPart.from_tool_use(ToolCall(id=str(block.id), name=str(block.name), input=dict(raw_input))))
+        text = "".join(p.text for p in parts if p.type == "text")
+        has_tools = any(p.type == "tool_use" for p in parts)
+        if not text.strip() and not has_tools:
             raise ProviderInvalidResponseError("resposta sem bloco de texto")
         usage = getattr(message, "usage", None)
         usage_dict = {
             k: int(getattr(usage, k, 0) or 0)
-            for k in ("input_tokens", "output_tokens", "cache_read_input_tokens")
+            for k in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
             if usage is not None and getattr(usage, k, None) is not None
         }
+        model = str(getattr(message, "model", self.model))
+        self._usage.record(model, usage_dict, latency)
         fallback_used = any(getattr(b, "type", "") == "fallback" for b in content)
         return ModelResponse(
             text=text,
-            model=str(getattr(message, "model", self.model)),
+            model=model,
             stop_reason=stop,
             usage=usage_dict,
             truncated=(stop == "max_tokens"),
             fallback_used=fallback_used,
             latency=latency,
+            parts=parts,
             raw=message,
+            raw_content=content,
         )
 
     async def aclose(self) -> None:
@@ -388,6 +561,7 @@ class FallbackProvider(ModelProvider):
     ) -> None:
         if not providers:
             raise ValueError("FallbackProvider precisa de ao menos um provider")
+        super().__init__()
         self.providers = list(providers)
         self.max_retries = max_retries
         self.base_delay = base_delay
@@ -395,6 +569,14 @@ class FallbackProvider(ModelProvider):
         self._sleep = sleep
         self.model = providers[0].model
         self.supports_images = all(p.supports_images for p in providers)
+        self.supports_tools = all(p.supports_tools for p in providers)
+
+    @property
+    def usage(self) -> UsageTracker:
+        total = UsageTracker()
+        for p in self.providers:
+            total = total.merge(p.usage)
+        return total
 
     async def complete(self, request: ModelRequest) -> ModelResponse:
         errors: list[ProviderError] = []
@@ -426,38 +608,54 @@ class FallbackProvider(ModelProvider):
             await p.aclose()
 
     def describe(self) -> dict[str, Any]:
-        return {"provider": self.name, "chain": [p.describe() for p in self.providers]}
+        return {"provider": self.name, "chain": [p.describe() for p in self.providers], "usage": self.usage.to_dict()}
 
 
 # ----------------------------------------------------------------------- fake
 class FakeProvider(ModelProvider):
     """Provider determinístico para testes e exemplos offline.
 
-    ``responses`` pode conter strings (devolvidas em ordem), exceções (levantadas)
-    ou callables ``(request) -> str | Exception``. Registra todos os pedidos em
-    ``requests`` para asserções.
+    ``responses`` pode conter strings (texto devolvido em ordem), objetos
+    ``ModelResponse`` (ex.: com chamadas de ferramenta, ver ``tool_response``),
+    exceções (levantadas) ou callables ``(request) -> item``. Registra todos
+    os pedidos em ``requests`` para asserções.
     """
 
     name = "fake"
 
     def __init__(self, responses: Sequence[Any] | None = None, model: str = "fake-model", latency: float = 0.0):
+        super().__init__()
         self.model = model
         self._responses = list(responses or [])
         self.requests: list[ModelRequest] = []
         self.latency = latency
 
+    @staticmethod
+    def tool_response(name: str, tool_input: dict[str, Any], *, call_id: str | None = None, text: str = "") -> ModelResponse:
+        """Resposta que pede a execução de uma ferramenta."""
+        call = ToolCall(id=call_id or f"call_{random.randrange(1 << 30):x}", name=name, input=tool_input)
+        parts = ([ContentPart.from_text(text)] if text else []) + [ContentPart.from_tool_use(call)]
+        return ModelResponse(text=text, model="fake-model", stop_reason="tool_use", parts=parts)
+
     async def complete(self, request: ModelRequest) -> ModelResponse:
-        self.requests.append(request)
+        # Guarda uma cópia rasa: loops de ferramentas reutilizam a mesma lista de mensagens.
+        self.requests.append(ModelRequest(messages=list(request.messages), system=request.system, max_tokens=request.max_tokens, effort=request.effort, tools=list(request.tools), output_schema=request.output_schema, metadata=dict(request.metadata)))
         if self.latency:
             await asyncio.sleep(self.latency)
         if not self._responses:
             raise ProviderInvalidResponseError("FakeProvider sem respostas programadas")
         item = self._responses.pop(0)
-        if callable(item):
+        if callable(item) and not isinstance(item, BaseException):
             item = item(request)
         if isinstance(item, BaseException):
             raise item
-        return ModelResponse(text=str(item), model=self.model, stop_reason="end_turn")
+        if isinstance(item, ModelResponse):
+            item.model = self.model
+            self._usage.record(self.model, {"input_tokens": 100, "output_tokens": 50}, 0.0)
+            return item
+        text = str(item)
+        self._usage.record(self.model, {"input_tokens": 100, "output_tokens": 50}, 0.0)
+        return ModelResponse(text=text, model=self.model, stop_reason="end_turn", parts=[ContentPart.from_text(text)])
 
 
 # ------------------------------------------------------------------- fábrica
@@ -469,24 +667,11 @@ def build_provider(config: Any) -> ModelProvider:
     * ``llm_enable_fallbacks`` liga tanto o fallback server-side por recusa
       quanto a cadeia de retries/fallback do lado do cliente.
     """
-    primary = AnthropicProvider(
-        model=config.llm_model,
-        max_tokens=config.llm_max_tokens,
-        effort=config.llm_effort,
-        server_fallbacks=config.llm_enable_fallbacks,
-        timeout=config.llm_timeout,
-    )
+    common = dict(max_tokens=config.llm_max_tokens, effort=config.llm_effort, timeout=config.llm_timeout, cache_prompts=config.llm_cache_prompts)
+    primary = AnthropicProvider(model=config.llm_model, server_fallbacks=config.llm_enable_fallbacks, **common)
     if not config.llm_enable_fallbacks:
         return primary
     chain: list[ModelProvider] = [primary]
     for model in config.llm_fallback_models:
-        chain.append(
-            AnthropicProvider(
-                model=model,
-                max_tokens=config.llm_max_tokens,
-                effort=config.llm_effort,
-                server_fallbacks=True,
-                timeout=config.llm_timeout,
-            )
-        )
+        chain.append(AnthropicProvider(model=model, server_fallbacks=True, **common))
     return FallbackProvider(chain, max_retries=config.llm_max_retries)

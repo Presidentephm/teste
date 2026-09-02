@@ -317,7 +317,8 @@ class TestObserver(Observer):
         if not self.command:
             return None
         cmd = [self.sandbox.config.python_executable, *self.command]
-        return await self.sandbox.run_command(cmd, timeout=self.sandbox.config.sandbox_timeout * 4)
+        isolated = bool(getattr(self.sandbox.config, "tests_isolated", True))
+        return await self.sandbox.run_command(cmd, timeout=self.sandbox.config.sandbox_timeout * 4, isolated=isolated)
 
     async def observe(self, *, result: Any = None, **_: Any) -> list[Observation]:
         if result is None:

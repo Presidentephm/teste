@@ -15,6 +15,22 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+DEFAULT_EFFORT_BY_ERROR: dict[str, str] = {
+    "NameError": "low",
+    "ImportError": "low",
+    "ModuleNotFoundError": "low",
+    "IndentationError": "low",
+    "TabError": "low",
+    "SyntaxError": "medium",
+    "AttributeError": "medium",
+    "TypeError": "medium",
+    "KeyError": "medium",
+    "TIMEOUT": "high",
+    "TESTS": "high",
+    "default": "high",
+}
+
+
 @dataclass
 class AgentConfig:
     """Parâmetros globais do núcleo.
@@ -69,12 +85,18 @@ class AgentConfig:
     llm_fallback_models: tuple[str, ...] = ()
     llm_timeout: float = 600.0
     llm_max_retries: int = 2
+    llm_use_tools: bool = True         # o modelo lê arquivos sob demanda via ferramentas
+    llm_max_tool_rounds: int = 8       # rodadas de ferramentas por proposta
+    llm_cache_prompts: bool = True     # cache_control no prefixo estável (tools + system)
+    # Esforço do modelo por tipo de erro (chave: nome da exceção ou "TIMEOUT"/"TESTS"/"default").
+    effort_by_error: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_EFFORT_BY_ERROR))
     extra_sandbox_env: dict[str, str] = field(default_factory=dict)
 
     # -- ciclo autônomo
     max_retries: int = 3               # tentativas de patch fracassadas (rollback/patch inválido) antes de desistir
     total_timeout: float | None = None # tempo máximo (s) de um ``run`` inteiro; None = sem limite
     test_command: tuple[str, ...] | None = None  # ex.: ("-m", "unittest", "discover", "-s", "tests")
+    tests_isolated: bool = True        # roda os testes na cópia temporária do projeto
     observation_interval: float = 5.0  # segundos entre observações visuais "por tempo"
     log_patterns: tuple[str, ...] = ("*.log", "logs/*.log")
 
@@ -86,6 +108,7 @@ class AgentConfig:
     vision_images: tuple[str, ...] = ()
     vision_fps: float = 2.0
     vision_store_frames: bool = False
+    vision_ocr: bool = True            # usa Tesseract quando disponível
 
     # -- memória e segurança
     memory_limit: int = 100
@@ -111,6 +134,11 @@ class AgentConfig:
             raise ValueError("vision_source deve ser camera, screen ou image")
         if self.llm_effort not in ("low", "medium", "high", "xhigh", "max"):
             raise ValueError("llm_effort inválido")
+        for key, value in self.effort_by_error.items():
+            if value not in ("low", "medium", "high", "xhigh", "max"):
+                raise ValueError(f"effort_by_error[{key!r}] inválido: {value}")
+        if self.llm_max_tool_rounds < 1:
+            raise ValueError("llm_max_tool_rounds deve ser >= 1")
         self.test_command = tuple(self.test_command) if self.test_command else None
         self.llm_fallback_models = tuple(self.llm_fallback_models)
         self.vision_images = tuple(str(p) for p in self.vision_images)
@@ -119,6 +147,13 @@ class AgentConfig:
     def backup_dir(self) -> Path:
         """Caminho absoluto da pasta de backups."""
         return self.project_root / self.backup_dir_name
+
+    def effort_for(self, error_signature: str | None) -> str:
+        """Esforço do modelo para uma assinatura de erro (``"TipoErro@..."``)."""
+        if not error_signature:
+            return self.effort_by_error.get("default", self.llm_effort)
+        key = error_signature.split("@", 1)[0].split(":", 1)[0]
+        return self.effort_by_error.get(key, self.effort_by_error.get("default", self.llm_effort))
 
     @property
     def memory_path(self) -> Path | None:

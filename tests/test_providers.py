@@ -63,7 +63,8 @@ class TranslationTests(unittest.TestCase):
         self.assertEqual(kw["max_tokens"], 123)
         self.assertEqual(kw["thinking"], {"type": "adaptive"})
         self.assertEqual(kw["output_config"], {"effort": "low"})
-        self.assertEqual(kw["system"], "sys")
+        self.assertEqual(kw["system"], [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}])
+        self.assertEqual(AnthropicProvider(cache_prompts=False)._build_kwargs(_req())["system"], "sys")
         self.assertEqual(kw["messages"][0]["content"][1]["type"], "image")
         self.assertEqual(ModelRequest(messages=[ModelMessage("user", [ContentPart.from_image(b"x")])]).image_count, 1)
 

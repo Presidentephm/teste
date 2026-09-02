@@ -23,6 +23,8 @@ Implementações:
 
 from __future__ import annotations
 
+import builtins
+import difflib
 import json
 import logging
 import re
@@ -45,6 +47,7 @@ from .providers import (
     ProviderInterrupted,
 )
 from .sandbox import ExecutionResult
+from .tools import PATCH_SCHEMA, ProjectToolbox, summarize_tool_input
 
 logger = logging.getLogger("agent_core.strategies")
 
@@ -78,6 +81,8 @@ class FailureContext:
     memory: AgentMemory | None = None            # memória de execução
     tests: ExecutionResult | None = None         # último resultado de testes, se houver
     vision_available: bool = False               # o loop consegue observar visualmente?
+    code_manager: Any = None                     # acesso confinado ao projeto (ferramentas do modelo)
+    effort: str | None = None                    # esforço sugerido para o modelo nesta falha
 
     @property
     def error_line(self) -> int | None:
@@ -153,7 +158,9 @@ class HeuristicFixStrategy(FixStrategy):
         1. ``NameError`` para módulo da stdlib      -> ``import <mod>``
         2. ``NameError`` para símbolo de outro módulo do projeto
                                                     -> ``from <mod> import <sym>``
-        3. ``TabError``/``IndentationError`` com tabs -> converte tabs em 4 espaços
+        3. ``NameError`` por erro de digitação (um único nome muito parecido
+           definido/importado/builtin)              -> corrige o nome na linha do erro
+        4. ``TabError``/``IndentationError`` com tabs -> converte tabs em 4 espaços
     """
 
     name = "heuristic"
@@ -199,7 +206,7 @@ class HeuristicFixStrategy(FixStrategy):
                     import_line = f"from {module} import {name}"
                     break
         if import_line is None:
-            return None
+            return self._fix_typo(ctx, name)
 
         new_source = insert_import(ctx.failing_source, import_line)
         return FixProposal(
@@ -210,10 +217,49 @@ class HeuristicFixStrategy(FixStrategy):
         )
 
     # -- regra 3
-    def _fix_tabs(self, ctx: FailureContext) -> FixProposal:
-        new_source = "\n".join(line.expandtabs(4) for line in ctx.failing_source.splitlines())
-        if ctx.failing_source.endswith("\n"):
-            new_source += "\n"
+    def _fix_typo(self, ctx: FailureContext, name: str) -> FixProposal | None:
+        analysis = ctx.failing_analysis
+        line_no = ctx.error_line
+        if analysis is None or line_no is None or ctx.failing_source is None:
+            return None
+        candidates = set(analysis.defined_names) | set(analysis.imported_names) | {b for b in dir(builtins) if not b.startswith("_")}
+        candidates.discard(name)
+        matches = difflib.get_close_matches(name, sorted(candidates), n=2, cutoff=0.8)
+        if len(matches) != 1:
+            return None  # ambíguo ou sem candidato: não arrisca
+        lines = ctx.failing_source.splitlines(keepends=True)
+        if line_no > len(lines):
+            return None
+        pattern = re.compile(rf"\b{re.escape(name)}\b")
+        fixed_line, count = pattern.subn(matches[0], lines[line_no - 1])
+        if count == 0:
+            return None
+        lines[line_no - 1] = fixed_line
+        return FixProposal(
+            patches=[FilePatch(path=ctx.failing_file, content="".join(lines), reason=f"heuristic: typo {name}->{matches[0]}")],
+            rationale=f"NameError para '{name}': provável erro de digitação de '{matches[0]}' na linha {line_no}.",
+            confidence=0.7,
+            strategy=self.name,
+        )
+
+    # -- regra 4
+    def _fix_tabs(self, ctx: FailureContext) -> FixProposal | None:
+        # O interpretador expande tabs para colunas múltiplas de 8; tenta essa
+        # leitura primeiro e só depois a convenção de 4 espaços, sempre
+        # verificando se o resultado compila.
+        new_source: str | None = None
+        for width in (8, 4):
+            candidate = "\n".join(line.expandtabs(width) for line in ctx.failing_source.splitlines())
+            if ctx.failing_source.endswith("\n"):
+                candidate += "\n"
+            try:
+                compile(candidate, ctx.failing_file or "<tabs>", "exec")
+            except SyntaxError:
+                continue
+            new_source = candidate
+            break
+        if new_source is None:
+            return None
         return FixProposal(
             patches=[FilePatch(path=ctx.failing_file, content=new_source, reason="heuristic: tabs->spaces")],
             rationale="Indentação mista (tabs/espaços) normalizada para 4 espaços.",
@@ -293,10 +339,11 @@ class ModelFixStrategy(FixStrategy):
 
     name = "model"
 
-    def __init__(self, provider: ModelProvider, *, system_prompt: str = _SYSTEM_PROMPT, include_images: bool = True) -> None:
+    def __init__(self, provider: ModelProvider, *, system_prompt: str = _SYSTEM_PROMPT, include_images: bool = True, structured_output: bool = True) -> None:
         self.provider = provider
         self.system_prompt = system_prompt
         self.include_images = include_images
+        self.structured_output = structured_output  # output_config.format com o JSON Schema do patch
         self.last_response: Any = None
 
     # -- prompt
@@ -334,13 +381,22 @@ class ModelFixStrategy(FixStrategy):
         parts.append(f"## Iteração atual\n{ctx.attempt}")
         return "\n\n".join(parts)
 
-    def build_request(self, ctx: FailureContext, diagnosis: str = "") -> ModelRequest:
-        parts: list[ContentPart] = [ContentPart.from_text(self.build_prompt(ctx, diagnosis))]
+    def _image_parts(self, ctx: FailureContext) -> list[ContentPart]:
+        parts: list[ContentPart] = []
         if self.include_images and ctx.multimodal is not None and self.provider.supports_images:
             for obs in reversed(ctx.multimodal.images()):
                 parts.append(ContentPart.from_text(f"[imagem: {obs.source}] {obs.summary}"))
                 parts.append(ContentPart.from_image(obs.image.data, obs.image.media_type))
-        return ModelRequest(messages=[ModelMessage("user", parts)], system=self.system_prompt)
+        return parts
+
+    def build_request(self, ctx: FailureContext, diagnosis: str = "") -> ModelRequest:
+        parts: list[ContentPart] = [ContentPart.from_text(self.build_prompt(ctx, diagnosis))] + self._image_parts(ctx)
+        return ModelRequest(
+            messages=[ModelMessage("user", parts)],
+            system=self.system_prompt,
+            effort=ctx.effort,
+            output_schema=PATCH_SCHEMA if self.structured_output else None,
+        )
 
     # -- chamada
     async def propose(self, ctx: FailureContext, diagnosis: str = "") -> FixProposal | None:
@@ -424,6 +480,107 @@ class ClaudeFixStrategy(ModelFixStrategy):
                 provider = build_provider(config)
         super().__init__(provider)
         self.config = config
+
+
+_TOOL_SYSTEM_PROMPT = """\
+Você é o módulo de auto-correção de um agente autônomo que reescreve o próprio \
+código-fonte Python. Receberá um diagnóstico inicial (traceback, arquivo que \
+falhou, evidências de logs/testes/tela) e ferramentas de leitura do projeto.
+
+Método: (1) leia o que for necessário com read_file/search/outline/list_files, \
+sem pedir arquivos irrelevantes; (2) identifique a causa raiz; (3) chame \
+propose_patch UMA vez com a menor alteração que corrija a causa, sem mudar o \
+comportamento pretendido e sem silenciar exceções com try/except genérico. \
+Não repita tentativas listadas na memória. Prefira search_replace com trechos \
+exatos e únicos (respeite a indentação); use replace_full só para mudanças \
+extensas. Se não houver correção segura, chame propose_patch com patches vazio \
+e explique no rationale.
+"""
+
+
+class ToolFixStrategy(ModelFixStrategy):
+    """Correção com ferramentas: o modelo lê o projeto sob demanda.
+
+    Loop manual de ``tool_use``: cada rodada envia o histórico, executa as
+    chamadas pedidas (somente leitura, via ``ProjectToolbox``) e devolve os
+    resultados até o modelo chamar ``propose_patch`` ou esgotar
+    ``max_rounds``. Se o modelo responder em texto JSON em vez de usar a
+    ferramenta, o texto ainda é aceito.
+    """
+
+    name = "tools"
+
+    def __init__(self, provider: ModelProvider, *, max_rounds: int = 8, system_prompt: str = _TOOL_SYSTEM_PROMPT, include_images: bool = True) -> None:
+        super().__init__(provider, system_prompt=system_prompt, include_images=include_images, structured_output=True)
+        self.max_rounds = max_rounds
+        self.last_rounds = 0
+        self.last_tool_calls: list[str] = []
+
+    def build_prompt(self, ctx: FailureContext, diagnosis: str = "") -> str:
+        """Prompt compacto: sem esqueleto do projeto (o modelo pede via ferramentas)."""
+        parts = [f"## Script executado\n{ctx.script}"]
+        if diagnosis:
+            parts.append(f"## Diagnóstico preliminar\n{diagnosis}")
+        parts.append(f"## Resultado\n{ctx.result.summary()}")
+        if ctx.result.stderr.strip():
+            parts.append(f"## stderr (traceback)\n```\n{ctx.result.stderr.strip()[-4000:]}\n```")
+        if ctx.failing_file and ctx.failing_source is not None:
+            parts.append(f"## Arquivo que falhou: {ctx.failing_file}\n```python\n{self._numbered(ctx.failing_source)}\n```")
+        if ctx.project_outline:
+            parts.append("## Arquivos do projeto\n" + "\n".join(sorted(ctx.project_outline)))
+        if ctx.tests is not None:
+            parts.append(f"## Testes\n{ctx.tests.summary()}\n```\n{ctx.tests.stderr.strip()[-2000:]}\n```")
+        if ctx.multimodal is not None:
+            extra = [o for o in ctx.multimodal.observations if o.kind in (ObservationKind.LOG, ObservationKind.VISION, ObservationKind.TEST)]
+            if extra:
+                parts.append("## Outras evidências\n" + "\n\n".join(o.to_prompt_text(1500) for o in extra[-6:]))
+        if ctx.memory is not None and len(ctx.memory):
+            parts.append(f"## Memória do agente (não repita)\n{ctx.memory.to_prompt_text()}")
+        parts.append(f"## Iteração atual\n{ctx.attempt}")
+        return "\n\n".join(parts)
+
+    async def propose(self, ctx: FailureContext, diagnosis: str = "") -> FixProposal | None:
+        if ctx.code_manager is None or not self.provider.supports_tools:
+            # Sem acesso ao projeto: cai no modo de prompt único.
+            return await ModelFixStrategy.propose(self, ctx, diagnosis)
+        toolbox = ProjectToolbox(ctx.code_manager)
+        messages = [ModelMessage("user", [ContentPart.from_text(self.build_prompt(ctx, diagnosis))] + self._image_parts(ctx))]
+        request = ModelRequest(messages=messages, system=self.system_prompt, tools=toolbox.specs(), effort=ctx.effort)
+        self.last_rounds = 0
+        self.last_tool_calls = []
+        final_text = ""
+        for _ in range(self.max_rounds):
+            self.last_rounds += 1
+            try:
+                response = await self.provider.complete(request)
+            except ProviderInterrupted:
+                raise
+            except ProviderError as exc:
+                logger.error("provider %s falhou: %s", self.provider.name, exc)
+                return None
+            self.last_response = response
+            if response.truncated:
+                logger.warning("resposta truncada por max_tokens; aumente llm_max_tokens.")
+            final_text = response.text
+            if not response.wants_tools:
+                break
+            messages.append(ModelMessage.assistant_from(response))
+            results: list[ContentPart] = []
+            for call in response.tool_calls:
+                result = await toolbox.execute(call)
+                self.last_tool_calls.append(summarize_tool_input(call))
+                logger.info("ferramenta %s -> %s", summarize_tool_input(call), "erro" if result.is_error else f"{len(result.content)} chars")
+                results.append(ContentPart.from_tool_result(call.id, result.content, is_error=result.is_error))
+            messages.append(ModelMessage.tool_results(results))
+            if toolbox.proposal is not None:
+                break
+        else:
+            logger.warning("limite de %d rodadas de ferramentas atingido", self.max_rounds)
+        payload = toolbox.proposal_json() or final_text
+        proposal = self.parse_response(payload) if payload else None
+        if proposal is not None:
+            proposal.strategy = self.name
+        return proposal
 
 
 def _extract_json(text: str) -> Any:
@@ -647,12 +804,22 @@ class HeuristicPlanner:
 
 
 class ModelPlanner:
-    """Consulta o provider com o contexto multimodal completo."""
+    """Consulta o provider com o contexto multimodal completo.
+
+    Com ``use_tools`` (padrão) usa ``ToolFixStrategy``: o modelo recebe um
+    prompt compacto e lê arquivos sob demanda; caso contrário usa
+    ``ModelFixStrategy`` com o esqueleto do projeto no prompt.
+    """
 
     name = "model"
 
-    def __init__(self, provider: ModelProvider | None, *, max_attempts: int = 3) -> None:
-        self.strategy = ModelFixStrategy(provider) if provider is not None else None
+    def __init__(self, provider: ModelProvider | None, *, max_attempts: int = 3, use_tools: bool = True, max_tool_rounds: int = 8) -> None:
+        if provider is None:
+            self.strategy = None
+        elif use_tools:
+            self.strategy = ToolFixStrategy(provider, max_rounds=max_tool_rounds)
+        else:
+            self.strategy = ModelFixStrategy(provider)
         self.max_attempts = max_attempts
 
     async def plan(self, ctx: FailureContext, diagnosis: Diagnosis) -> Decision | None:
@@ -705,9 +872,13 @@ class AutoStrategy(FixStrategy):
         analyzers: list[EvidenceAnalyzer] | None = None,
         planners: list[Planner] | None = None,
         use_heuristics: bool = True,
+        use_tools: bool = True,
+        max_tool_rounds: int = 8,
+        effort_by_error: dict[str, str] | None = None,
         diagnose_hook: Callable[[Diagnosis], Awaitable[None] | None] | None = None,
     ) -> None:
         self.provider = provider
+        self.effort_by_error = effort_by_error
         self.analyzers: list[EvidenceAnalyzer] = analyzers if analyzers is not None else [
             TracebackAnalyzer(), TestAnalyzer(), LogAnalyzer(), VisionAnalyzer(), MemoryAnalyzer()
         ]
@@ -717,7 +888,7 @@ class AutoStrategy(FixStrategy):
             self.planners = [ObservationPlanner(), RollbackPlanner()]
             if use_heuristics:
                 self.planners.append(HeuristicPlanner())
-            self.planners.append(ModelPlanner(provider))
+            self.planners.append(ModelPlanner(provider, use_tools=use_tools, max_tool_rounds=max_tool_rounds))
         self._diagnose_hook = diagnose_hook
         self.last_diagnosis: Diagnosis | None = None
 
@@ -746,7 +917,15 @@ class AutoStrategy(FixStrategy):
             diagnosis.needs.add("tests")
         return diagnosis
 
+    def effort_for(self, ctx: FailureContext) -> str | None:
+        """Esforço do modelo para esta falha (mapa próprio, senão o do contexto)."""
+        if self.effort_by_error:
+            key = ctx.result.signature.split("@", 1)[0].split(":", 1)[0]
+            return self.effort_by_error.get(key, self.effort_by_error.get("default"))
+        return ctx.effort
+
     async def decide(self, ctx: FailureContext) -> Decision:
+        ctx.effort = self.effort_for(ctx)
         diagnosis = self.diagnose(ctx)
         self.last_diagnosis = diagnosis
         if self._diagnose_hook is not None:
